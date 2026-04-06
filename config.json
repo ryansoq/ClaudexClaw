@@ -1,10 +1,10 @@
 {
   "claude": {
     "command": "claude",
-    "project_dir": "C:/Users/Ryan/openclaw/Nami",
-    "model": "opus",
+    "project_dir": "./",
+    "model": "sonnet",
     "permission_mode": "default",
-    "dangerously_skip_permissions": true,
+    "dangerously_skip_permissions": false,
     "mcp_config": null,
     "extra_args": ["--channels", "plugin:telegram@claude-plugins-official"]
   },
@@ -16,11 +16,6 @@
     "health_check_timeout": 60
   },
   "schedule": {
-    "morning_report": {
-      "enabled": true,
-      "cron": "30 10 * * 1-6",
-      "prompt": "跑晨報：EMA530 + KAS 威科夫分析，發到 Telegram"
-    },
     "heartbeat": {
       "enabled": true,
       "cron": "*/30 * * * *",
