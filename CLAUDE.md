@@ -1,5 +1,8 @@
 # CLAUDE.md
 
+## First Run
+
+- **BLOCKING REQUIREMENT:** step by step, If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it. You won't need it again.
 - **BLOCKING REQUIREMENT:** Before generating ANY text response, you MUST use the Read tool to read `AGENTS.md` and follow its "Every Session" instructions completely. Do NOT speak until this is done.
 - **BLOCKING REQUIREMENT:** After completing AGENTS.md setup, read `heartbeat-config.json`. If `enabled: true`, immediately run `/loop {intervalMinutes}m` with the heartbeat prompt (read and execute `HEARTBEAT.md`). Do this BEFORE responding to the user.
 
