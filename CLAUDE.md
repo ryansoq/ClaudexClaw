@@ -11,35 +11,65 @@
 
 ## Telegram Setup
 
-If Telegram MCP tools are not in the available tool list, follow these steps:
+Let your agent chat with you on Telegram. Here's the full flow:
 
-### Prerequisites
-- **bun** must be installed (default path: `~/.bun/bin/bun.exe`)
-- If bun is not in system PATH, MCP config must use the full path
-- **Launch parameter**: Claude Code must include `--channels plugin:telegram@claude-plugins-official` to **receive** TG messages (without it, you can only send but not receive)
+### What you need
+- **bun** runtime installed ([bun.sh](https://bun.sh))
+- A Telegram account
 
-### Setup Steps
-1. **Install Telegram plugin** (if not already installed): search and install `telegram` plugin in Claude Code
-2. **Bot Token**: stored in `~/.claude/channels/telegram/.env`, format: `TELEGRAM_BOT_TOKEN=<token>`
-   - To create a new bot, go to `@BotFather` on TG → `/newbot`
-3. **Access config**: `~/.claude/channels/telegram/access.json`
-   ```json
+### Step-by-step
+
+```
+1. Install bun (if not installed)
+   curl -fsSL https://bun.sh/install | bash
+
+2. Create a Telegram bot
+   → Open Telegram, find @BotFather
+   → Send /newbot, follow the prompts
+   → Copy the bot token (looks like: 123456:ABC-DEF...)
+
+3. Install the Telegram plugin in Claude Code
+   → Run Claude Code, type: /install-plugin telegram
+   → Or search for "telegram" in the plugin list
+
+4. Save your bot token
+   → Create/edit: ~/.claude/channels/telegram/.env
+   → Content: TELEGRAM_BOT_TOKEN=<your-token-here>
+
+5. Set who can talk to the bot
+   → Create/edit: ~/.claude/channels/telegram/access.json
    {
      "dmPolicy": "allowlist",
-     "allowFrom": ["<user_telegram_id>"],
+     "allowFrom": ["<your-telegram-user-id>"],
      "groups": {},
      "pending": {}
    }
-   ```
-   - **Note**: the field is `allowFrom` (string array), NOT `allowlist`
-   - Get your TG user ID from `@userinfobot` or similar
-4. **Fix cache `.mcp.json` path**: if bun is not in system PATH, change `command` in `~/.claude/plugins/cache/claude-plugins-official/telegram/*/.mcp.json` to the full bun path (plugin updates may overwrite it)
-5. **Reload**: run `/reload-plugins`, verify bun process is running (`tasklist | grep bun`)
+   → Get your TG user ID: message @userinfobot on Telegram
+   → IMPORTANT: the field is "allowFrom" (NOT "allowlist")
 
-### Common Issues
-- **409 Conflict**: another service is polling with the same bot token — switch token or stop the other side
-- **bun not running**: check if cache `.mcp.json` command is the full path
-- **Can't receive messages but bot is running**: check access.json format (`allowFrom` not `allowlist`)
+6. Add --channels to your launch command
+   → In config.json, extra_args should include:
+     "--channels", "plugin:telegram@claude-plugins-official"
+   → (Already included in default config.json)
+
+7. Launch ClawX (or Claude Code)
+   python clawx.py
+   → The bot should come online
+   → Send it a message on Telegram to test!
+```
+
+### If bun is not in PATH
+Some systems (especially WSL) don't add bun to PATH automatically.
+Fix: edit `~/.claude/plugins/cache/claude-plugins-official/telegram/*/.mcp.json`
+and change `"command"` to the full bun path (e.g. `~/.bun/bin/bun` or `~/.bun/bin/bun.exe`).
+
+### Troubleshooting
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| 409 Conflict error | Another service is polling with same token | Stop the other bot or create a new token |
+| bun not running | Plugin can't find bun | Set full path in .mcp.json (see above) |
+| Bot runs but can't receive messages | access.json wrong format | Check `allowFrom` field (not `allowlist`) |
+| Bot sends but doesn't receive | Missing --channels flag | Add to config.json extra_args |
 
 ## Heartbeat
 
