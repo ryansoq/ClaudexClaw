@@ -4,7 +4,7 @@
     "project_dir": "./",
     "model": "opus",
     "permission_mode": null,
-    "dangerously_skip_permissions": true,
+    "resume_last": false,
     "mcp_config": null,
     "extra_args": ["--channels", "plugin:telegram@claude-plugins-official"]
   },

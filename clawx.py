@@ -104,6 +104,10 @@ class ClawX:
         else:
             cmd.append("--dangerously-skip-permissions")
 
+        # Resume last session
+        if cfg.get("resume_last"):
+            cmd.append("--continue")
+
         # MCP config
         if cfg.get("mcp_config"):
             cmd.extend(["--mcp-config", cfg["mcp_config"]])
