@@ -2,9 +2,9 @@
   "claude": {
     "command": "claude",
     "project_dir": "./",
-    "model": "sonnet",
-    "permission_mode": "default",
-    "dangerously_skip_permissions": false,
+    "model": "opus",
+    "permission_mode": null,
+    "dangerously_skip_permissions": true,
     "mcp_config": null,
     "extra_args": ["--channels", "plugin:telegram@claude-plugins-official"]
   },

@@ -98,11 +98,11 @@ class ClawX:
         if cfg.get("model"):
             cmd.extend(["--model", cfg["model"]])
 
-        # Permission mode
-        if cfg.get("dangerously_skip_permissions"):
-            cmd.append("--dangerously-skip-permissions")
-        elif cfg.get("permission_mode"):
+        # Permission mode — default to dangerously-skip-permissions
+        if cfg.get("permission_mode"):
             cmd.extend(["--permission-mode", cfg["permission_mode"]])
+        else:
+            cmd.append("--dangerously-skip-permissions")
 
         # MCP config
         if cfg.get("mcp_config"):
