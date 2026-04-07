@@ -71,6 +71,53 @@ and change `"command"` to the full bun path (e.g. `~/.bun/bin/bun` or `~/.bun/bi
 | Bot runs but can't receive messages | access.json wrong format | Check `allowFrom` field (not `allowlist`) |
 | Bot sends but doesn't receive | Missing --channels flag | Add to config.json extra_args |
 
+## ClawX Scheduling
+
+ClawX uses `config.json` to manage scheduled tasks. These are injected into the Claude session via PTY at the specified times — like someone typing the prompt for you.
+
+### How it works
+- ClawX runs [apscheduler](https://pypi.org/project/APScheduler/) in the background
+- On each cron match, it injects the `prompt` text into Claude's input
+- No 7-day expiry (unlike Claude's built-in cron)
+- Survives as long as the ClawX process is running
+
+### Adding a scheduled task
+
+Edit `config.json` → `schedule`:
+
+```json
+{
+  "schedule": {
+    "heartbeat": {
+      "enabled": true,
+      "cron": "*/30 * * * *",
+      "prompt": "Read HEARTBEAT.md if it exists. Follow it strictly."
+    },
+    "morning-report": {
+      "enabled": true,
+      "cron": "28 10 * * 1-6",
+      "prompt": "Run morning report (see memory/morning-report-template.md)"
+    }
+  }
+}
+```
+
+### Cron format
+Standard 5-field: `minute hour day-of-month month day-of-week`
+- `*/30 * * * *` → every 30 minutes
+- `28 10 * * 1-6` → 10:28 AM, Mon–Sat
+- `0 9 * * 1-5` → 9:00 AM, weekdays
+
+### vs Claude's built-in cron
+| | ClawX schedule | Claude cron |
+|---|---|---|
+| Expiry | None | 7 days |
+| Survives restart | Yes (in config) | No (session-only) |
+| Needs renewal | No | Yes (via heartbeat) |
+| Where it runs | apscheduler (Python) | Claude internal |
+
+**Recommendation:** Use ClawX schedule for recurring tasks (heartbeat, reports). Use Claude's built-in cron for one-shot reminders or tasks that need Claude-specific features (like durable flag).
+
 ## Heartbeat
 
 ### 環境判斷
