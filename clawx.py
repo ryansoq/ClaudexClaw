@@ -91,8 +91,8 @@ class ClawX:
         cfg = self.config["claude"]
         cmd = [cfg["command"]]
 
-        # Project directory
-        cmd.extend(["--add-dir", cfg["project_dir"]])
+        # Project directory (resolve to absolute)
+        cmd.extend(["--add-dir", self._get_project_dir()])
 
         # Model
         if cfg.get("model"):
@@ -233,49 +233,40 @@ class ClawX:
                 else:
                     self.logger.error(f"Max restarts ({max_restarts}) reached.")
 
+    def _get_project_dir(self):
+        """Resolve project_dir to absolute path."""
+        raw = self.config["claude"]["project_dir"]
+        # Resolve relative to config file location
+        p = Path(raw)
+        if not p.is_absolute():
+            p = BASE_DIR / p
+        return str(p.resolve())
+
     def _spawn_claude(self):
-        """Fork + exec Claude in a PTY."""
+        """Fork + exec Claude in a PTY using pty.fork()."""
         cmd = self.build_command()
+        project_dir = self._get_project_dir()
         self.logger.info(f"Starting: {' '.join(cmd)}")
+        self.logger.info(f"Working dir: {project_dir}")
 
-        # Fork with PTY
-        pid, fd = pty.openpty()
+        # pty.fork() handles all slave PTY setup automatically
+        child_pid, master_fd = pty.fork()
 
-        child_pid = os.fork()
         if child_pid == 0:
             # === Child process ===
-            os.close(fd)  # close master in child
-            os.setsid()
-
-            # Open slave side
-            slave_name = os.ttyname(pid)
-            os.close(pid)
-            slave_fd = os.open(slave_name, os.O_RDWR)
-
-            # Make slave the controlling terminal
-            os.dup2(slave_fd, 0)
-            os.dup2(slave_fd, 1)
-            os.dup2(slave_fd, 2)
-            if slave_fd > 2:
-                os.close(slave_fd)
-
-            # Set environment
             os.environ["TERM"] = os.environ.get("TERM", "xterm-256color")
-
-            # Exec Claude
-            cwd = self.config["claude"]["project_dir"]
-            if cwd:
-                os.chdir(cwd)
+            os.chdir(project_dir)
             os.execvp(cmd[0], cmd)
+            # If execvp fails, exit child
+            os._exit(1)
         else:
             # === Parent process ===
-            os.close(pid)  # close slave in parent
-            self.master_fd = fd
+            self.master_fd = master_fd
             self.child_pid = child_pid
             self.started_at = datetime.now()
 
             # Set terminal size
-            set_winsize(fd)
+            set_winsize(master_fd)
 
             # Save PID
             PID_FILE.write_text(str(child_pid))
@@ -400,14 +391,15 @@ def run_oneshot(prompt):
     """Run a one-shot prompt via claude -p."""
     config = load_config()
     cfg = config["claude"]
-    cmd = [cfg["command"], "-p", prompt, "--add-dir", cfg["project_dir"]]
+    project_dir = str((BASE_DIR / cfg["project_dir"]).resolve()) if not Path(cfg["project_dir"]).is_absolute() else cfg["project_dir"]
+    cmd = [cfg["command"], "-p", prompt, "--add-dir", project_dir]
     if cfg.get("model"):
         cmd.extend(["--model", cfg["model"]])
 
     import subprocess
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=300,
-        cwd=cfg["project_dir"],
+        cwd=project_dir,
     )
     return result.stdout
 
