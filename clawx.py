@@ -26,6 +26,7 @@ import struct
 import fcntl
 import termios
 import logging
+import shutil
 from pathlib import Path
 from datetime import datetime
 from threading import Thread, Event, Lock
@@ -89,7 +90,21 @@ class ClawX:
     def build_command(self):
         """Build the claude CLI command."""
         cfg = self.config["claude"]
-        cmd = [cfg["command"]]
+        # Resolve command to full path so child process can find it
+        raw_cmd = cfg["command"]
+        resolved = shutil.which(raw_cmd)
+        if resolved is None:
+            # Check common install locations
+            for candidate in [
+                Path.home() / ".local" / "bin" / raw_cmd,
+                Path("/usr/local/bin") / raw_cmd,
+            ]:
+                if candidate.exists() and os.access(candidate, os.X_OK):
+                    resolved = str(candidate)
+                    break
+        if resolved is None:
+            raise FileNotFoundError(f"Command '{raw_cmd}' not found in PATH or common locations")
+        cmd = [resolved]
 
         # Project directory (resolve to absolute)
         cmd.extend(["--add-dir", self._get_project_dir()])
