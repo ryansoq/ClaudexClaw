@@ -4,7 +4,10 @@
 
 - **BLOCKING REQUIREMENT:** step by step, If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it. You won't need it again.
 - **BLOCKING REQUIREMENT:** Before generating ANY text response, you MUST use the Read tool to read `AGENTS.md` and follow its "Every Session" instructions completely. Do NOT speak until this is done.
-- **BLOCKING REQUIREMENT:** After completing AGENTS.md setup, read `heartbeat-config.json`. If `enabled: true`, immediately run `/loop {intervalMinutes}m` with the heartbeat prompt (read and execute `HEARTBEAT.md`). Do this BEFORE responding to the user.
+- **BLOCKING REQUIREMENT:** After completing AGENTS.md setup, check heartbeat setup:
+  1. Check if running under ClawX: look for `mono.fifo` in the project directory
+  2. **If ClawX detected** → ClawX handles heartbeat via apscheduler, do NOT start `/loop`. Just read `heartbeat-config.json` for quiet hours reference.
+  3. **If NOT in ClawX** (raw Claude CLI) → read `heartbeat-config.json`. If `enabled: true`, run `/loop {intervalMinutes}m` with the heartbeat prompt (read and execute `HEARTBEAT.md`). Do this BEFORE responding to the user.
 
 ## Telegram Setup
 
@@ -40,7 +43,9 @@ If Telegram MCP tools are not in the available tool list, follow these steps:
 
 ## Heartbeat
 
-On each session start, read `heartbeat-config.json` and start heartbeat accordingly:
+### 環境判斷
+- **ClawX 環境**（`mono.fifo` 存在）→ 心跳由 ClawX apscheduler 注入，不需要 `/loop`
+- **Raw Claude CLI** → 用 `/loop` 啟動心跳
 
 ### Config file: `heartbeat-config.json`
 ```json
@@ -51,7 +56,7 @@ On each session start, read `heartbeat-config.json` and start heartbeat accordin
 }
 ```
 
-### Startup Rules
+### Startup Rules (Raw Claude CLI only)
 1. Read `heartbeat-config.json` at session start
 2. If `enabled: true`, use `/loop {intervalMinutes}m` to start periodic heartbeat
 3. On each heartbeat:
