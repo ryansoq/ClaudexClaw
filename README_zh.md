@@ -295,6 +295,24 @@ Claude 會用 `--add-dir` 載入該目錄。ClawX 在自己的資料夾，專案
 
 全部建立在小小的 markdown 檔案上。不需要資料庫、雲服務、訂閱。只有檔案和官方 Claude Code CLI。
 
+## 📝 小提醒
+
+ClawX 是「常駐型」服務 — 它要 24/7 跑著心跳和排程才有意義。實務上請注意：
+
+- **電腦不要休眠**：筆電蓋上、桌機進入待機，ClawX 跟著停。系統電源設定改成「永不睡眠」（或至少螢幕關閉但系統不休眠）
+- **網路要穩**：心跳會打 API，斷網會錯過排程。最好接有線網路或穩定 Wi-Fi
+- **終端機關掉 = ClawX 結束**：用 `tmux`、`screen`、或 `nohup` 把 ClawX 包起來，終端機關掉也不會中斷
+  ```bash
+  tmux new -s clawx
+  python3 clawx.py
+  # Ctrl+B 然後按 D 離開但保持執行
+  ```
+- **WSL2 使用者**：Windows 進入睡眠時 WSL2 也會暫停。電源計畫設「平衡」並關閉「睡眠」
+- **重新登入後**：log files 在 `logs/`，可以 `tail -f logs/clawx-*.log` 確認運作狀態
+- **檢查 ClawX 還活著**：`ls mono.pid && kill -0 $(cat mono.pid) && echo "alive"`
+
+如果是長期常駐用途，建議跑在 VPS、樹莓派、或永遠開機的桌機上 — 比筆電穩很多。
+
 ## 開發
 
 ### 跑測試
