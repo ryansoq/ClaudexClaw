@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.8"
+# dependencies = [
+#   "apscheduler>=3.0",
+# ]
+# ///
 """
 ClawX: Thin PTY wrapper around Claude Code CLI.
 

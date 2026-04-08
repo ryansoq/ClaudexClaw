@@ -79,6 +79,25 @@ ClawX/
 
 ## 快速開始
 
+### 使用 [uv](https://docs.astral.sh/uv/)（推薦 — 零設定）
+
+```bash
+git clone https://github.com/ryansoq/ClawX.git
+cd ClawX
+
+# uv 會讀 clawx.py 裡的 PEP 723 metadata，自動裝 deps
+uv run clawx.py
+```
+
+uv 會建立隔離的 venv、安裝 `apscheduler`、跑起 ClawX — 全部一個指令。不用 `pip install`、不用管 venv。首次跑要幾秒，之後 cached，啟動 <200ms。
+
+還沒裝 uv？一次性安裝：
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### 使用一般 Python
+
 ```bash
 git clone https://github.com/ryansoq/ClawX.git
 cd ClawX
