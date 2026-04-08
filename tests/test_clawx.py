@@ -487,3 +487,11 @@ class TestCleanup:
 #
 # - test_max_restarts_gives_up:
 #     Same as auto-restart — timing dependent. Note for future suite.
+
+
+# ============================================================================
+# Allow direct execution: `python3 tests/test_clawx.py`
+# ============================================================================
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
