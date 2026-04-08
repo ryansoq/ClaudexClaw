@@ -258,6 +258,27 @@ Traditional AI assistants are stateless — every conversation starts from zero.
 
 All built on tiny markdown files. No database, no cloud service, no subscription. Just files and the official Claude Code CLI.
 
+## Development
+
+### Running tests
+
+```bash
+pip install pytest apscheduler
+python3 tests/test_clawx.py
+```
+
+19 tests covering smoke, FIFO injection, schedule registration, build_command flags, transcript logging, cleanup, and path resolution. All run in ~14 seconds against a mock claude binary.
+
+### Pre-commit hook
+
+Install once after cloning to auto-run tests before every commit:
+
+```bash
+bash scripts/install-hooks.sh
+```
+
+GitHub Actions also runs the suite on every push and PR — see `.github/workflows/test.yml`.
+
 ## License
 
 MIT

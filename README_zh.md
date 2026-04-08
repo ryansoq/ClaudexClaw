@@ -258,6 +258,27 @@ Claude 會用 `--add-dir` 載入該目錄。ClawX 在自己的資料夾，專案
 
 全部建立在小小的 markdown 檔案上。不需要資料庫、雲服務、訂閱。只有檔案和官方 Claude Code CLI。
 
+## 開發
+
+### 跑測試
+
+```bash
+pip install pytest apscheduler
+python3 tests/test_clawx.py
+```
+
+19 個測試涵蓋 smoke、FIFO 注入、schedule 註冊、build_command 旗標、transcript log、清理、路徑解析。透過 mock claude binary，全部約 14 秒跑完。
+
+### Pre-commit hook
+
+clone 後安裝一次，之後每次 commit 前會自動跑測試：
+
+```bash
+bash scripts/install-hooks.sh
+```
+
+GitHub Actions 也會在每次 push 和 PR 時跑同樣的測試 — 見 `.github/workflows/test.yml`。
+
 ## License
 
 MIT
