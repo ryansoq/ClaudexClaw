@@ -4,6 +4,8 @@
 
 ClawX is a thin PTY wrapper + soul framework for [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code). A set of tiny config files that give Claude Code persistent identity, memory, heartbeat, and scheduled tasks — all within the official CLI.
 
+![ClawX Demo](demo.png)
+
 ## How It Works
 
 ```

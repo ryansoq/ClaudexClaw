@@ -4,6 +4,8 @@
 
 ClawX 是 [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 的輕量 PTY 外殼 + 靈魂框架。一組小小的設定檔，讓 Claude Code 擁有持久身份、記憶、心跳和排程任務 — 全部在官方 CLI 框架內運作。
 
+![ClawX Demo](demo.png)
+
 ## 運作原理
 
 ```
