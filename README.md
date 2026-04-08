@@ -134,7 +134,7 @@ python clawx.py inject "run morning report"
 
 ## Configuration
 
-### config.json
+Everything ClawX needs lives in one file: `config.json`. Three sections — `claude` (how to launch Claude), `session` (auto-restart behavior), `schedule` (cron jobs).
 
 ```json
 {
@@ -143,6 +143,8 @@ python clawx.py inject "run morning report"
     "project_dir": "./",
     "model": "opus",
     "permission_mode": null,
+    "resume_last": false,
+    "mcp_config": null,
     "extra_args": ["--channels", "plugin:telegram@claude-plugins-official"]
   },
   "session": {
@@ -161,16 +163,51 @@ python clawx.py inject "run morning report"
 }
 ```
 
+### `claude` — how to launch Claude Code
+
 | Field | Description |
 |-------|-------------|
-| `model` | Claude model (`opus`, `sonnet`, `haiku`) |
-| `permission_mode` | `null` = skip permissions (default), `"default"` = normal mode |
-| `extra_args` | Additional CLI args (e.g. `--channels` for Telegram) |
-| `schedule` | Cron jobs that inject prompts on schedule |
+| `command` | Claude binary (`claude`, or absolute path like `/home/user/.local/bin/claude`). ClawX auto-resolves bare names via `$PATH` + fallbacks (`~/.local/bin`, `/usr/local/bin`). |
+| `project_dir` | Working directory passed via `--add-dir`. Use `"./"` for the ClawX folder, or an absolute path to point at another project. |
+| `model` | `opus`, `sonnet`, or `haiku` |
+| `permission_mode` | `null` = skip permissions (default), `"default"` = normal mode, `"plan"` = plan mode |
+| `resume_last` | If `true`, launches with `--continue` to resume the most recent session (memory carries over across restarts). |
+| `mcp_config` | Path to an MCP config file, or `null` to skip. |
+| `extra_args` | Any extra CLI args appended verbatim — e.g. `--channels plugin:telegram@claude-plugins-official` for Telegram. |
 
-### Telegram Integration
+### `session` — auto-restart & health checks
 
-Add `--channels plugin:telegram@claude-plugins-official` to `extra_args` (included by default). See `CLAUDE.md` for full setup.
+| Field | Description |
+|-------|-------------|
+| `auto_restart` | If `true`, ClawX respawns Claude when it dies. |
+| `max_restart_attempts` | Stop trying after this many failed restarts. |
+| `restart_delay_seconds` | Wait this long before each restart. |
+| `health_check_interval` | Seconds between liveness checks. Logged as "Health OK | uptime=… | restarts=…". |
+
+### `schedule` — cron jobs (apscheduler)
+
+Each entry runs on a cron schedule and injects its `prompt` into the live Claude session via the FIFO. Standard 5-field cron: `minute hour day month day_of_week`.
+
+```json
+"schedule": {
+  "heartbeat": {
+    "enabled": true,
+    "cron": "*/30 * * * *",
+    "prompt": "Read HEARTBEAT.md if it exists. Follow it strictly."
+  },
+  "morning_report": {
+    "enabled": true,
+    "cron": "0 8 * * *",
+    "prompt": "Run the morning report."
+  }
+}
+```
+
+Set `enabled: false` to disable a job without deleting it. ClawX uses APScheduler — long-running, no 7-day expiry.
+
+### Telegram
+
+Add `--channels plugin:telegram@claude-plugins-official` to `extra_args` (already included in the default config). See `CLAUDE.md` for the bot/token setup.
 
 ## Setup Options
 

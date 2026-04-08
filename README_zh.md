@@ -134,7 +134,7 @@ python clawx.py inject "執行晨報"
 
 ## 設定
 
-### config.json
+ClawX 全部設定都在一個檔案：`config.json`，分三段 — `claude`（怎麼啟動 Claude）、`session`（自動重啟）、`schedule`（排程任務）。
 
 ```json
 {
@@ -143,6 +143,8 @@ python clawx.py inject "執行晨報"
     "project_dir": "./",
     "model": "opus",
     "permission_mode": null,
+    "resume_last": false,
+    "mcp_config": null,
     "extra_args": ["--channels", "plugin:telegram@claude-plugins-official"]
   },
   "session": {
@@ -161,16 +163,51 @@ python clawx.py inject "執行晨報"
 }
 ```
 
+### `claude` — 怎麼啟動 Claude Code
+
 | 欄位 | 說明 |
 |------|------|
-| `model` | Claude 模型（`opus`、`sonnet`、`haiku`） |
-| `permission_mode` | `null` = 跳過權限（預設），`"default"` = 正常模式 |
-| `extra_args` | 額外 CLI 參數（如 `--channels` 接 Telegram） |
-| `schedule` | Cron 排程，時間到自動注入 prompt |
+| `command` | Claude 執行檔（`claude` 或絕對路徑如 `/home/user/.local/bin/claude`）。ClawX 會自動透過 `$PATH` + fallback（`~/.local/bin`、`/usr/local/bin`）解析。 |
+| `project_dir` | 工作目錄，透過 `--add-dir` 傳入。`"./"` 表示 ClawX 資料夾，或填絕對路徑指向其他專案。 |
+| `model` | `opus`、`sonnet`、`haiku` |
+| `permission_mode` | `null` = 跳過權限（預設）、`"default"` = 正常模式、`"plan"` = 計畫模式 |
+| `resume_last` | `true` 時會加 `--continue` 接續最近一次 session（記憶跨重啟保留）。 |
+| `mcp_config` | MCP 設定檔路徑，或 `null` 跳過。 |
+| `extra_args` | 任意 CLI 參數原樣附加 — 例如接 Telegram 的 `--channels plugin:telegram@claude-plugins-official`。 |
 
-### Telegram 整合
+### `session` — 自動重啟與健康檢查
 
-在 `extra_args` 加上 `--channels plugin:telegram@claude-plugins-official`（預設已包含）。詳見 `CLAUDE.md`。
+| 欄位 | 說明 |
+|------|------|
+| `auto_restart` | `true` 時 Claude 掛掉會自動重啟 |
+| `max_restart_attempts` | 重啟失敗超過這個次數就放棄 |
+| `restart_delay_seconds` | 每次重啟前等待秒數 |
+| `health_check_interval` | 心跳檢查間隔（秒）。log 顯示為 "Health OK \| uptime=… \| restarts=…" |
+
+### `schedule` — Cron 排程（apscheduler）
+
+每個項目按 cron 觸發，把 `prompt` 透過 FIFO 注入到執行中的 Claude session。標準 5 欄 cron：`分 時 日 月 星期`。
+
+```json
+"schedule": {
+  "heartbeat": {
+    "enabled": true,
+    "cron": "*/30 * * * *",
+    "prompt": "Read HEARTBEAT.md if it exists. Follow it strictly."
+  },
+  "morning_report": {
+    "enabled": true,
+    "cron": "0 8 * * *",
+    "prompt": "Run the morning report."
+  }
+}
+```
+
+`enabled: false` 可以暫時關閉某個排程而不刪掉。ClawX 用 APScheduler — 持續執行、沒有 7 天到期問題。
+
+### Telegram
+
+在 `extra_args` 加上 `--channels plugin:telegram@claude-plugins-official`（預設已包含）。bot/token 設定詳見 `CLAUDE.md`。
 
 ## 安裝方式
 
