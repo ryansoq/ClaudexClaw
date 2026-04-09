@@ -1052,6 +1052,278 @@ class TestCompactWatcher:
 
 
 # ============================================================================
+# TELEGRAM PREREQ CHECK TESTS
+# ============================================================================
+
+class TestTelegramPrereqs:
+    """ClawX._check_telegram_prereqs() inspects the Telegram plugin setup
+    on startup and logs a warning if something will prevent the bot from
+    talking. It does NOT install anything. The log file is the only
+    surface — user reads it when something's off.
+
+    Two failure modes it catches:
+      1. bun runtime not on PATH AND not in common install locations
+         → the Telegram plugin's MCP server can't launch at all.
+      2. bun is installed at ~/.bun/bin/bun (common WSL case) but the
+         plugin's .mcp.json still has bare ``"command": "bun"`` → Claude
+         Code will fail to spawn the MCP with "bun: not found".
+    """
+
+    def _import_clawx(self, work, monkeypatch):
+        monkeypatch.chdir(work)
+        sys.path.insert(0, str(work))
+        if "clawx" in sys.modules:
+            del sys.modules["clawx"]
+        import clawx as clawx_mod
+        return clawx_mod
+
+    def _cleanup(self, work):
+        if str(work) in sys.path:
+            sys.path.remove(str(work))
+        if "clawx" in sys.modules:
+            del sys.modules["clawx"]
+
+    def _write_plugin_mcp(self, plugin_dir, command_value):
+        """Write a telegram plugin .mcp.json with the given command value."""
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+        mcp = {
+            "mcpServers": {
+                "telegram": {
+                    "command": command_value,
+                    "args": ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "start"],
+                }
+            }
+        }
+        (plugin_dir / ".mcp.json").write_text(json.dumps(mcp, indent=2))
+
+    def _capture_warnings(self, inst):
+        """Capture warning-level log records from the ClawX instance logger."""
+        records = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        h = _Capture()
+        h.setLevel(logging.WARNING)
+        inst.logger.addHandler(h)
+        return records
+
+    # --- telegram detection logic ---------------------------------------
+
+    def test_no_telegram_channel_skips_check(self, tmp_path, monkeypatch):
+        """No --channels plugin:telegram in extra_args → no prereq check,
+        no warnings, no crash even if bun is missing from the planet."""
+        mock_log = tmp_path / "mock.log"
+        config = make_config(mock_log, extra_args=[])  # no telegram
+        work = setup_workdir(tmp_path, config)
+        clawx_mod = self._import_clawx(work, monkeypatch)
+        try:
+            inst = clawx_mod.ClawX()
+            records = self._capture_warnings(inst)
+            # Bun detection hook returns None (missing) — must still not warn
+            inst._check_telegram_prereqs(
+                bun_finder=lambda: None,
+                plugin_cache_dir=tmp_path / "nonexistent",
+            )
+            assert records == [], \
+                f"No warnings expected with no telegram channel, got: " \
+                f"{[r.getMessage() for r in records]}"
+        finally:
+            self._cleanup(work)
+
+    # --- bun missing case ------------------------------------------------
+
+    def test_bun_missing_logs_install_instructions(self, tmp_path, monkeypatch):
+        """Telegram channel enabled + bun not found anywhere → must log a
+        WARNING containing the official install command so the user can
+        fix it. No auto-install."""
+        mock_log = tmp_path / "mock.log"
+        config = make_config(
+            mock_log,
+            extra_args=["--channels", "plugin:telegram@claude-plugins-official"],
+        )
+        work = setup_workdir(tmp_path, config)
+        clawx_mod = self._import_clawx(work, monkeypatch)
+        try:
+            inst = clawx_mod.ClawX()
+            records = self._capture_warnings(inst)
+            inst._check_telegram_prereqs(
+                bun_finder=lambda: None,
+                plugin_cache_dir=tmp_path / "plugins-cache",
+            )
+            assert len(records) >= 1, "Expected a WARNING about missing bun"
+            msg = " ".join(r.getMessage() for r in records)
+            assert "bun" in msg.lower()
+            # The install command from bun.sh must be in the message
+            assert "bun.sh/install" in msg, \
+                f"Expected install URL in warning, got: {msg}"
+        finally:
+            self._cleanup(work)
+
+    # --- bun in PATH + .mcp.json happy path -----------------------------
+
+    def test_bun_in_path_with_correct_mcp_no_warning(self, tmp_path, monkeypatch):
+        """Telegram channel enabled + bun in PATH + .mcp.json uses bare
+        "bun" (works because it's in PATH) → no warning."""
+        mock_log = tmp_path / "mock.log"
+        config = make_config(
+            mock_log,
+            extra_args=["--channels", "plugin:telegram@claude-plugins-official"],
+        )
+        work = setup_workdir(tmp_path, config)
+        plugin_cache = tmp_path / "plugins-cache"
+        plugin_dir = plugin_cache / "claude-plugins-official" / "telegram" / "0.0.4"
+        self._write_plugin_mcp(plugin_dir, "bun")
+
+        clawx_mod = self._import_clawx(work, monkeypatch)
+        try:
+            inst = clawx_mod.ClawX()
+            records = self._capture_warnings(inst)
+            # bun_finder returns "bun" signalling it's in PATH
+            inst._check_telegram_prereqs(
+                bun_finder=lambda: "bun",
+                plugin_cache_dir=plugin_cache,
+            )
+            assert records == [], \
+                f"No warning expected (bun in PATH + bare bun in mcp), got: " \
+                f"{[r.getMessage() for r in records]}"
+        finally:
+            self._cleanup(work)
+
+    # --- bun installed but not in PATH + .mcp.json still bare ----------
+
+    def test_bun_home_but_mcp_bare_logs_patch_instruction(self, tmp_path, monkeypatch):
+        """The most common WSL case: user installed bun via curl | bash,
+        it sits at ~/.bun/bin/bun, but the telegram plugin's .mcp.json
+        still has bare "bun" which will fail because ~/.bun/bin isn't in
+        Claude's PATH. WARN with the exact sed/jq command (or just the
+        path the user needs to set)."""
+        mock_log = tmp_path / "mock.log"
+        config = make_config(
+            mock_log,
+            extra_args=["--channels", "plugin:telegram@claude-plugins-official"],
+        )
+        work = setup_workdir(tmp_path, config)
+        plugin_cache = tmp_path / "plugins-cache"
+        plugin_dir = plugin_cache / "claude-plugins-official" / "telegram" / "0.0.4"
+        self._write_plugin_mcp(plugin_dir, "bun")
+
+        fake_bun_abs = tmp_path / "fake-bun" / "bin" / "bun"
+        fake_bun_abs.parent.mkdir(parents=True)
+        fake_bun_abs.write_text("#!/bin/sh\nexit 0\n")
+        fake_bun_abs.chmod(0o755)
+
+        clawx_mod = self._import_clawx(work, monkeypatch)
+        try:
+            inst = clawx_mod.ClawX()
+            records = self._capture_warnings(inst)
+            # bun_finder returns absolute path (bun NOT in PATH, found in home)
+            inst._check_telegram_prereqs(
+                bun_finder=lambda: str(fake_bun_abs),
+                plugin_cache_dir=plugin_cache,
+            )
+            assert len(records) >= 1, \
+                "Expected a WARNING about bare bun in .mcp.json"
+            msg = " ".join(r.getMessage() for r in records)
+            # Message must reference the absolute bun path the user should use
+            assert str(fake_bun_abs) in msg, \
+                f"Expected absolute bun path in warning, got: {msg}"
+            # Message must point at the actual .mcp.json file to patch
+            assert ".mcp.json" in msg
+        finally:
+            self._cleanup(work)
+
+    # --- .mcp.json already patched → no warning -------------------------
+
+    def test_bun_home_with_mcp_already_absolute_no_warning(self, tmp_path, monkeypatch):
+        """User already patched .mcp.json to use absolute bun path → no
+        warning even though bun isn't in PATH. This is the known-good
+        state Ryan is already running in."""
+        mock_log = tmp_path / "mock.log"
+        config = make_config(
+            mock_log,
+            extra_args=["--channels", "plugin:telegram@claude-plugins-official"],
+        )
+        work = setup_workdir(tmp_path, config)
+        plugin_cache = tmp_path / "plugins-cache"
+        plugin_dir = plugin_cache / "claude-plugins-official" / "telegram" / "0.0.4"
+
+        fake_bun_abs = tmp_path / "fake-bun" / "bin" / "bun"
+        fake_bun_abs.parent.mkdir(parents=True)
+        fake_bun_abs.write_text("#!/bin/sh\nexit 0\n")
+        fake_bun_abs.chmod(0o755)
+
+        # .mcp.json uses the absolute path — already good
+        self._write_plugin_mcp(plugin_dir, str(fake_bun_abs))
+
+        clawx_mod = self._import_clawx(work, monkeypatch)
+        try:
+            inst = clawx_mod.ClawX()
+            records = self._capture_warnings(inst)
+            inst._check_telegram_prereqs(
+                bun_finder=lambda: str(fake_bun_abs),
+                plugin_cache_dir=plugin_cache,
+            )
+            assert records == [], \
+                f"No warning expected (already patched), got: " \
+                f"{[r.getMessage() for r in records]}"
+        finally:
+            self._cleanup(work)
+
+    # --- plugin not yet installed → silent skip -------------------------
+
+    def test_plugin_not_yet_installed_silent_skip(self, tmp_path, monkeypatch):
+        """Telegram channel configured but the plugin cache dir doesn't
+        exist yet (Claude Code will fetch it on first run). Skip the
+        .mcp.json check silently — complaining about a file that will
+        exist in a minute is noise."""
+        mock_log = tmp_path / "mock.log"
+        config = make_config(
+            mock_log,
+            extra_args=["--channels", "plugin:telegram@claude-plugins-official"],
+        )
+        work = setup_workdir(tmp_path, config)
+
+        fake_bun_abs = tmp_path / "fake-bun" / "bin" / "bun"
+        fake_bun_abs.parent.mkdir(parents=True)
+        fake_bun_abs.write_text("#!/bin/sh\nexit 0\n")
+        fake_bun_abs.chmod(0o755)
+
+        clawx_mod = self._import_clawx(work, monkeypatch)
+        try:
+            inst = clawx_mod.ClawX()
+            records = self._capture_warnings(inst)
+            # bun exists, plugin dir doesn't
+            inst._check_telegram_prereqs(
+                bun_finder=lambda: str(fake_bun_abs),
+                plugin_cache_dir=tmp_path / "nonexistent-plugin-cache",
+            )
+            assert records == [], \
+                f"No warning expected (plugin not yet installed), got: " \
+                f"{[r.getMessage() for r in records]}"
+        finally:
+            self._cleanup(work)
+
+    # --- default bun_finder works (integration-y) -----------------------
+
+    def test_default_bun_finder_resolves_path_or_home(self, tmp_path, monkeypatch):
+        """_find_bun() (the real one, no injection) must return either a
+        PATH-resolved ``bun``, an absolute path to ~/.bun/bin/bun, or None.
+        Never raise, never return something else."""
+        mock_log = tmp_path / "mock.log"
+        work = setup_workdir(tmp_path, make_config(mock_log))
+        clawx_mod = self._import_clawx(work, monkeypatch)
+        try:
+            inst = clawx_mod.ClawX()
+            result = inst._find_bun()
+            # Either None (missing) or a truthy string
+            assert result is None or (isinstance(result, str) and result)
+        finally:
+            self._cleanup(work)
+
+
+# ============================================================================
 # Notes on tests we DID NOT include and why
 # ============================================================================
 #

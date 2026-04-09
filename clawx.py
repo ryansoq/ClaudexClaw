@@ -366,6 +366,121 @@ class ClawX:
         except Exception as e:
             self.logger.error(f"[SIGHUP] Reload failed: {e}")
 
+    def _find_bun(self):
+        """Return an invocable bun identifier or None if bun is missing.
+
+        Preference order:
+          1. ``bun`` resolved via PATH (return the string ``"bun"``)
+          2. Absolute path at ``~/.bun/bin/bun`` (common WSL/curl-install)
+          3. Absolute path at ``~/.local/bin/bun``
+          4. None — bun not found anywhere we know to look
+
+        Never raises.
+        """
+        try:
+            if shutil.which("bun"):
+                return "bun"
+        except Exception:
+            pass
+        for candidate in [
+            Path.home() / ".bun" / "bin" / "bun",
+            Path.home() / ".local" / "bin" / "bun",
+        ]:
+            try:
+                if candidate.exists() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+            except OSError:
+                continue
+        return None
+
+    def _check_telegram_prereqs(self, bun_finder=None, plugin_cache_dir=None):
+        """Inspect the Telegram plugin setup and log WARNINGs if something
+        will prevent the Telegram MCP server from launching.
+
+        Pure detection: we never install or patch. The log file is the
+        whole UX — user reads it when something's off and copy-pastes
+        the printed fix command.
+
+        Two failure modes we catch:
+
+        1. ``--channels plugin:telegram`` is in extra_args but bun is
+           not installed anywhere we can find it → the MCP server has
+           no runtime at all. We print the official install URL.
+
+        2. bun is installed at an absolute path (e.g. ``~/.bun/bin/bun``)
+           but the plugin's ``.mcp.json`` still has bare ``"command":
+           "bun"``. Claude Code will try to exec ``bun`` from its own
+           PATH and fail. We print the exact file + absolute path the
+           user needs to swap in.
+
+        Both ``bun_finder`` and ``plugin_cache_dir`` are injectable so
+        tests can exercise the logic without touching ~/.claude.
+        """
+        extra_args = self.config.get("claude", {}).get("extra_args") or []
+        # Look for a "plugin:telegram..." token in --channels arguments
+        telegram_enabled = any(
+            isinstance(a, str) and "plugin:telegram" in a
+            for a in extra_args
+        )
+        if not telegram_enabled:
+            return
+
+        finder = bun_finder if bun_finder is not None else self._find_bun
+        bun = finder()
+
+        if bun is None:
+            self.logger.warning(
+                "[TelegramPrereq] bun runtime not found, Telegram plugin will "
+                "fail to launch. Install with:\n"
+                "  curl -fsSL https://bun.sh/install | bash\n"
+                "Then restart ClawX. If bun ends up at ~/.bun/bin/bun but not "
+                "in PATH, ClawX will log a follow-up fix on next start."
+            )
+            return
+
+        # bun exists — does the plugin .mcp.json point at it correctly?
+        if plugin_cache_dir is None:
+            plugin_cache_dir = Path.home() / ".claude" / "plugins" / "cache"
+        plugin_cache_dir = Path(plugin_cache_dir)
+        telegram_root = plugin_cache_dir / "claude-plugins-official" / "telegram"
+        if not telegram_root.exists():
+            # Plugin not installed yet — Claude Code will fetch it on first
+            # run. No point warning about a file that doesn't exist yet.
+            return
+
+        # Find every .mcp.json under any version subdir
+        mcp_files = list(telegram_root.glob("*/.mcp.json"))
+        if not mcp_files:
+            return
+
+        # If bun is a bare word, any .mcp.json with "bun" works — done.
+        bun_in_path = (bun == "bun")
+
+        for mcp_path in mcp_files:
+            try:
+                data = json.loads(mcp_path.read_text())
+            except (OSError, json.JSONDecodeError) as e:
+                self.logger.warning(
+                    f"[TelegramPrereq] could not read {mcp_path}: {e}"
+                )
+                continue
+            cmd = (
+                data.get("mcpServers", {})
+                    .get("telegram", {})
+                    .get("command")
+            )
+            if not cmd:
+                continue
+            if cmd == "bun" and not bun_in_path:
+                self.logger.warning(
+                    f"[TelegramPrereq] {mcp_path} has bare \"command\": \"bun\" "
+                    f"but bun is not in PATH. Claude Code will fail to launch "
+                    f"the Telegram MCP. Patch it to the absolute path:\n"
+                    f"  {bun}\n"
+                    f"Edit: {mcp_path}\n"
+                    f"Change: \"command\": \"bun\"  →  \"command\": \"{bun}\""
+                )
+
     def _on_compact(self, event):
         """Handle a detected compact_boundary event.
 
@@ -534,6 +649,7 @@ class ClawX:
         # Setup
         self._setup_fifo()
         self._setup_schedules()
+        self._check_telegram_prereqs()
 
         # Save original terminal settings
         old_attrs = None
