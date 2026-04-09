@@ -88,6 +88,125 @@ def set_winsize(fd):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, sz)
 
 
+class CompactWatcher:
+    """Tails Claude Code session JSONL files and fires a callback whenever
+    a ``compact_boundary`` event appears.
+
+    Claude Code writes each conversation to
+    ``~/.claude/projects/<slug>/<session_uuid>.jsonl``. When the CLI
+    auto-compacts the context (at ~90% of the model window) it appends a
+    single line with ``type=system`` and ``subtype=compact_boundary``. That
+    line is our signal that the in-process agent has just been summarized
+    — identity and recent context may have changed, so we want to (a)
+    inject an AGENTS.md re-read prompt and (b) notify the user.
+
+    Design notes:
+      - First sight of any file establishes a baseline (end-of-file). We
+        deliberately ignore historical content so ClawX restarts don't
+        replay old compacts.
+      - We dedup by the event ``uuid`` in case a file rewind re-reads the
+        same bytes.
+      - Scan is a simple poll loop. Reliable across FS types and cheap —
+        session files are tiny.
+      - Handler exceptions are caught and logged so a broken callback
+        can't kill the background thread.
+    """
+
+    def __init__(self, sessions_dir, logger, on_compact):
+        self.sessions_dir = Path(sessions_dir)
+        self.logger = logger
+        self.on_compact = on_compact
+        self.file_positions = {}  # Path -> last-read byte offset
+        self.seen_event_uuids = set()
+        self.stop_event = Event()
+
+    @staticmethod
+    def resolve_sessions_dir_from_project(project_dir):
+        """Claude Code slugifies project paths by replacing '/' with '-'
+        and prefixing with '-' (so /home/ymchang/clawd becomes
+        -home-ymchang-clawd). Return the corresponding sessions directory.
+        """
+        abs_path = str(Path(project_dir).resolve())
+        # Strip leading '/' then replace remaining '/' with '-', prefix with '-'
+        slug = "-" + abs_path.lstrip("/").replace("/", "-")
+        return Path.home() / ".claude" / "projects" / slug
+
+    def _scan_once(self):
+        """Single pass: append-only read of every *.jsonl in sessions_dir."""
+        if not self.sessions_dir.exists():
+            return
+        try:
+            files = sorted(self.sessions_dir.glob("*.jsonl"))
+        except OSError as e:
+            self.logger.warning(f"[CompactWatcher] glob failed: {e}")
+            return
+        for jsonl in files:
+            try:
+                size = jsonl.stat().st_size
+            except OSError:
+                continue
+            pos = self.file_positions.get(jsonl)
+            if pos is None:
+                # First time seeing this file — baseline at EOF so we
+                # don't replay historical content.
+                self.file_positions[jsonl] = size
+                continue
+            if size < pos:
+                # File truncated — reset to start
+                pos = 0
+            if size == pos:
+                continue
+            try:
+                with open(jsonl, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read(size - pos)
+            except OSError as e:
+                self.logger.warning(f"[CompactWatcher] read failed {jsonl.name}: {e}")
+                continue
+            self.file_positions[jsonl] = size
+            self._process_chunk(chunk)
+
+    def _process_chunk(self, chunk):
+        for raw_line in chunk.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(evt, dict):
+                continue
+            if evt.get("type") != "system" or evt.get("subtype") != "compact_boundary":
+                continue
+            uuid = evt.get("uuid")
+            if uuid and uuid in self.seen_event_uuids:
+                continue
+            if uuid:
+                self.seen_event_uuids.add(uuid)
+            try:
+                self.on_compact(evt)
+            except Exception as e:
+                self.logger.error(
+                    f"[CompactWatcher] handler raised for uuid={uuid}: {e}"
+                )
+
+    def run(self, interval=2.0):
+        """Background loop — call from a daemon Thread."""
+        self.logger.info(f"[CompactWatcher] watching {self.sessions_dir}")
+        while not self.stop_event.is_set():
+            try:
+                self._scan_once()
+            except Exception as e:
+                self.logger.error(f"[CompactWatcher] scan error: {e}")
+            # stop_event.wait returns True if set — exit promptly on shutdown
+            if self.stop_event.wait(interval):
+                break
+
+    def stop(self):
+        self.stop_event.set()
+
+
 class ClawX:
     """PTY-based Claude Code wrapper."""
 
@@ -101,6 +220,7 @@ class ClawX:
         self.started_at = None
         self.scheduler = None
         self.restart_count = 0
+        self.compact_watcher = None
 
     def build_command(self):
         """Build the claude CLI command."""
@@ -245,6 +365,88 @@ class ClawX:
             self.logger.info(f"[SIGHUP] Reload OK ({n} active jobs)")
         except Exception as e:
             self.logger.error(f"[SIGHUP] Reload failed: {e}")
+
+    def _on_compact(self, event):
+        """Handle a detected compact_boundary event.
+
+        Order matters: inject the AGENTS.md re-read FIRST so Claude's
+        next turn restores its identity (the compacted summary may have
+        dropped the 'who am I' part of the prompt). The user-facing TG
+        notification is a separate, user-friendly side-channel and does
+        not mention internal re-read mechanics.
+        """
+        meta = (event.get("compactMetadata") or {})
+        pre_tokens = meta.get("preTokens")
+        trigger = meta.get("trigger", "?")
+        uuid = event.get("uuid", "?")
+        session_id = (event.get("sessionId") or "")[:8]
+        self.logger.info(
+            f"[Compact] detected session={session_id} trigger={trigger} "
+            f"preTokens={pre_tokens} uuid={uuid}"
+        )
+
+        # (1) Internal: restore identity
+        self.inject(
+            "Read AGENTS.md if it exists and follow its "
+            "'Every Session' instructions completely."
+        )
+
+        # (2) Public: friendly notification to the user
+        self._notify_compact(event)
+
+    def _notify_compact(self, event):
+        """Send a user-friendly Telegram message about the auto-compact.
+
+        Reads bot token from ~/.claude/channels/telegram/.env and chat_id
+        from config.json -> compact_notify.telegram.chat_id. Fails soft —
+        notification is best-effort and must never crash the watcher.
+        """
+        cfg = (self.config.get("compact_notify") or {})
+        tg_cfg = (cfg.get("telegram") or {})
+        chat_id = tg_cfg.get("chat_id")
+        if not chat_id:
+            return  # notification not configured — silent no-op
+
+        token_file = Path(tg_cfg.get(
+            "token_env_file",
+            str(Path.home() / ".claude" / "channels" / "telegram" / ".env"),
+        )).expanduser()
+        token = None
+        try:
+            for line in token_file.read_text().splitlines():
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        except OSError as e:
+            self.logger.warning(f"[Compact] could not read TG token: {e}")
+            return
+        if not token:
+            return
+
+        meta = (event.get("compactMetadata") or {})
+        pre_tokens = meta.get("preTokens")
+        if isinstance(pre_tokens, (int, float)):
+            pct = pre_tokens / 200_000 * 100
+            body = (
+                f"🧠 context 快滿了（{int(pre_tokens/1000)}k / 200k tokens, "
+                f"{pct:.0f}%）正在自動壓縮記憶…"
+            )
+        else:
+            body = "🧠 context 自動壓縮中…"
+
+        try:
+            import urllib.parse
+            import urllib.request
+            payload = urllib.parse.urlencode({
+                "chat_id": str(chat_id),
+                "text": body,
+            }).encode("utf-8")
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            req = urllib.request.Request(url, data=payload, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+        except Exception as e:
+            self.logger.warning(f"[Compact] TG notify failed: {e}")
 
     def _run_scheduled(self, name, prompt):
         """Execute a scheduled prompt by injecting into the PTY."""
@@ -391,6 +593,21 @@ class ClawX:
 
         health_thread = Thread(target=self._health_loop, daemon=True)
         health_thread.start()
+
+        # Compact watcher: re-read AGENTS.md + notify on auto-compact.
+        # Enabled by default; set compact_notify.enabled=false to disable.
+        compact_cfg = self.config.get("compact_notify") or {}
+        if compact_cfg.get("enabled", True):
+            sessions_dir = CompactWatcher.resolve_sessions_dir_from_project(
+                self._get_project_dir()
+            )
+            self.compact_watcher = CompactWatcher(
+                sessions_dir=sessions_dir,
+                logger=self.logger,
+                on_compact=self._on_compact,
+            )
+            compact_thread = Thread(target=self.compact_watcher.run, daemon=True)
+            compact_thread.start()
 
         # Set terminal to raw mode for passthrough
         if sys.stdin.isatty():
