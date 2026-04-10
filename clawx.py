@@ -59,7 +59,8 @@ except ImportError:
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
-PID_FILE = BASE_DIR / "mono.pid"
+PID_FILE = BASE_DIR / "mono.pid"          # ClawX (parent) PID
+CHILD_PID_FILE = BASE_DIR / "mono-child.pid"  # Claude (child) PID
 FIFO_PATH = BASE_DIR / "mono.fifo"
 LOG_DIR = BASE_DIR / "logs"
 RESTART_EXIT_CODE = 42
@@ -706,8 +707,8 @@ class ClawX:
             # Set terminal size
             set_winsize(master_fd)
 
-            # Save PID
-            PID_FILE.write_text(str(child_pid))
+            # Save child PID
+            CHILD_PID_FILE.write_text(str(child_pid))
             self.logger.info(f"Session started (PID: {child_pid})")
 
     def _maybe_handle_startup_modal(self, chunk):
@@ -989,8 +990,8 @@ class ClawX:
             if self.scheduler:
                 self.scheduler.shutdown(wait=False)
 
-            if PID_FILE.exists():
-                PID_FILE.unlink()
+            if CHILD_PID_FILE.exists():
+                CHILD_PID_FILE.unlink()
 
             # Don't remove FIFO — other processes may still reference it
             self.logger.info("ClawX stopped.")
@@ -1060,14 +1061,19 @@ def self_restart():
 def main():
     if len(sys.argv) < 2:
         # Default: run PTY passthrough with restart loop
-        while True:
-            clawx = ClawX()
-            exit_code = clawx.run()
-            if exit_code != RESTART_EXIT_CODE:
-                break
-            delay = clawx.config.get("session", {}).get("restart_delay_seconds", 5)
-            print(f"\n[ClawX] Restarting in {delay}s...")
-            time.sleep(delay)
+        PID_FILE.write_text(str(os.getpid()))
+        try:
+            while True:
+                clawx = ClawX()
+                exit_code = clawx.run()
+                if exit_code != RESTART_EXIT_CODE:
+                    break
+                delay = clawx.config.get("session", {}).get("restart_delay_seconds", 5)
+                print(f"\n[ClawX] Restarting in {delay}s...")
+                time.sleep(delay)
+        finally:
+            if PID_FILE.exists():
+                PID_FILE.unlink()
         return
 
     command = sys.argv[1]
@@ -1093,7 +1099,7 @@ def main():
             pid = int(PID_FILE.read_text().strip())
             try:
                 os.kill(pid, signal.SIGTERM)
-                print(f"Sent SIGTERM to PID {pid}")
+                print(f"Sent SIGTERM to ClawX PID {pid}")
             except ProcessLookupError:
                 print(f"PID {pid} not found, cleaning up")
                 PID_FILE.unlink()
