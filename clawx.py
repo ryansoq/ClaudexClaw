@@ -25,6 +25,7 @@ import json
 import sys
 import os
 import pty
+import re
 import time
 import signal
 import select
@@ -43,6 +44,7 @@ from threading import Thread, Event, Lock
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_MISSED
 except ImportError:
     sys.stderr.write(
         "\nError: apscheduler is required but not installed.\n\n"
@@ -60,6 +62,43 @@ PID_FILE = BASE_DIR / "mono.pid"
 FIFO_PATH = BASE_DIR / "mono.fifo"
 LOG_DIR = BASE_DIR / "logs"
 
+# Modal-prompt detection: strip ANSI escape sequences before pattern matching
+# so colored TUI output doesn't fool the detector.
+_ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]")
+# How long after Claude spawn we keep watching for a startup modal.
+STARTUP_MODAL_WINDOW_SECONDS = 60
+# Cap on buffer size we keep for detection (Claude's startup output is small).
+STARTUP_MODAL_BUFFER_LIMIT = 32 * 1024
+
+
+def detect_startup_modal(buf: bytes):
+    """Detect a startup modal numbered-choice prompt in PTY output.
+
+    Claude Code with ``--continue`` may show an auto-compact prompt at
+    session resume. Without a human at the terminal that dialog blocks
+    the session forever. This detector spots the prompt so ClawX can
+    auto-select the safest option (last numbered choice = "do nothing").
+
+    Strategy: ANSI-strip the buffer, require BOTH:
+      1. A context keyword ("compact" / "summarize" / "auto-compact")
+      2. At least 2 distinct numbered options ("1." or "1)" form)
+
+    Returns the highest option number detected (the conventional
+    "skip / leave alone" slot in 3-option Claude prompts), or None
+    if no modal is present.
+    """
+    if not buf:
+        return None
+    text = _ANSI_RE.sub(b"", buf).decode("utf-8", errors="replace").lower()
+    if not any(kw in text for kw in ("compact", "summarize", "auto-compact")):
+        return None
+    numbers = set()
+    for match in re.finditer(r"(?:^|\s|\[)([1-9])[.)\]]", text, re.MULTILINE):
+        numbers.add(int(match.group(1)))
+    if len(numbers) < 2:
+        return None
+    return max(numbers)
+
 
 def load_config():
     with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -69,11 +108,18 @@ def load_config():
 def setup_logging():
     LOG_DIR.mkdir(exist_ok=True)
     log_file = LOG_DIR / f"clawx-{datetime.now().strftime('%Y%m%d')}.log"
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] [%(levelname)s] %(message)s"))
+
     logger = logging.getLogger("ClawX")
     logger.setLevel(logging.INFO)
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.addHandler(fh)
+
+    # Also capture apscheduler internals so silent scheduler bugs become visible.
+    aps_logger = logging.getLogger("apscheduler")
+    aps_logger.setLevel(logging.INFO)
+    aps_logger.addHandler(fh)
+
     return logger
 
 
@@ -221,6 +267,13 @@ class ClawX:
         self.scheduler = None
         self.restart_count = 0
         self.compact_watcher = None
+        # Scheduler liveness tracking — used by watchdog to detect silent
+        # apscheduler death (jobs registered but never fire).
+        self.last_job_event_at = None
+        # Startup modal detection state. Reset on each _spawn_claude.
+        self._startup_buffer = bytearray()
+        self._startup_modal_active = False
+        self._startup_modal_handled = False
 
     def build_command(self):
         """Build the claude CLI command."""
@@ -313,8 +366,23 @@ class ClawX:
     def _setup_schedules(self):
         """Set up cron-based schedules."""
         self.scheduler = BackgroundScheduler()
+        self.scheduler.add_listener(
+            self._on_job_event,
+            EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED,
+        )
         self._load_schedule_jobs()
         self.scheduler.start()
+        self.last_job_event_at = datetime.now()
+
+    def _on_job_event(self, event):
+        """Track scheduler liveness from any job firing (success/error/missed)."""
+        self.last_job_event_at = datetime.now()
+        if event.code == EVENT_JOB_ERROR:
+            self.logger.error(
+                f"[Schedule] Job '{event.job_id}' raised: {event.exception}"
+            )
+        elif event.code == EVENT_JOB_MISSED:
+            self.logger.warning(f"[Schedule] Job '{event.job_id}' MISSED")
 
     def _load_schedule_jobs(self):
         """Load (or reload) jobs from self.config into self.scheduler.
@@ -338,14 +406,50 @@ class ClawX:
                 day_of_week=parts[4],
             )
 
+            # Generous misfire_grace_time so jobs don't get silently dropped
+            # if the scheduler thread is briefly slow. APScheduler's default
+            # is 1 second, which is too tight under any GIL contention and
+            # was the root cause of the 2026-04-09 silent-scheduler bug.
             self.scheduler.add_job(
                 self._run_scheduled,
                 trigger,
                 args=[name, prompt],
                 id=name,
                 name=name,
+                misfire_grace_time=600,
+                coalesce=True,
             )
             self.logger.info(f"Scheduled '{name}': {cron_expr}")
+
+    def _scheduler_watchdog(self):
+        """Detect silently-dead apscheduler and self-heal via reload.
+
+        If we've registered any sub-hourly job (e.g. heartbeat */30) but have
+        seen ZERO job events in the last 75 minutes, the scheduler thread is
+        wedged. Reload schedules to recover (this is what manual SIGHUP does).
+        """
+        if not self.scheduler or not self.last_job_event_at:
+            return
+        # Only watchdog if at least one job is sub-hourly. Otherwise long
+        # gaps between jobs are normal.
+        has_frequent_job = False
+        for sched in self.config.get("schedule", {}).values():
+            if not sched.get("enabled"):
+                continue
+            cron_min = sched.get("cron", "").split()[0]
+            if "/" in cron_min or "," in cron_min or "*" == cron_min:
+                has_frequent_job = True
+                break
+        if not has_frequent_job:
+            return
+
+        idle = (datetime.now() - self.last_job_event_at).total_seconds()
+        if idle > 75 * 60:
+            self.logger.error(
+                f"[Watchdog] Scheduler idle for {idle/60:.1f}min — reloading"
+            )
+            self._reload_schedules()
+            self.last_job_event_at = datetime.now()
 
     def _reload_schedules(self, *_):
         """Reload schedules from config.json without restarting ClawX.
@@ -595,6 +699,7 @@ class ClawX:
             if self._is_alive():
                 uptime = str(datetime.now() - self.started_at).split(".")[0] if self.started_at else "?"
                 self.logger.info(f"Health OK | uptime={uptime} | restarts={self.restart_count}")
+                self._scheduler_watchdog()
             elif session_cfg.get("auto_restart", True) and not self.stop_event.is_set():
                 if self.restart_count < max_restarts:
                     self.logger.warning("Session died, auto-restarting...")
@@ -637,12 +742,59 @@ class ClawX:
             self.child_pid = child_pid
             self.started_at = datetime.now()
 
+            # Reset startup-modal detection state. We re-arm on every spawn
+            # because --continue can land us in a different conversation each
+            # time, with or without a compact prompt.
+            self._startup_buffer = bytearray()
+            self._startup_modal_active = True
+            self._startup_modal_handled = False
+
             # Set terminal size
             set_winsize(master_fd)
 
             # Save PID
             PID_FILE.write_text(str(child_pid))
             self.logger.info(f"Session started (PID: {child_pid})")
+
+    def _maybe_handle_startup_modal(self, chunk):
+        """Feed PTY output into the startup-modal detector.
+
+        Called from the main loop on every chunk read from master_fd while
+        we're still inside the spawn-time detection window. If a modal is
+        detected we auto-pick the highest-numbered option (Claude's
+        convention for "skip / leave alone") so the session never wedges
+        waiting for a human at the keyboard.
+        """
+        if not self._startup_modal_active or self._startup_modal_handled:
+            return
+        # Window expires after STARTUP_MODAL_WINDOW_SECONDS regardless of
+        # output volume — covers the "no modal at all" happy path.
+        if self.started_at and (
+            datetime.now() - self.started_at
+        ).total_seconds() > STARTUP_MODAL_WINDOW_SECONDS:
+            self._startup_modal_active = False
+            self._startup_buffer = bytearray()
+            return
+        self._startup_buffer.extend(chunk)
+        if len(self._startup_buffer) > STARTUP_MODAL_BUFFER_LIMIT:
+            # Drop oldest bytes — keep the tail where the prompt would be.
+            del self._startup_buffer[: -STARTUP_MODAL_BUFFER_LIMIT]
+        choice = detect_startup_modal(bytes(self._startup_buffer))
+        if choice is None:
+            return
+        # Pick the highest-numbered option (Claude's "do nothing" slot).
+        try:
+            with self.write_lock:
+                os.write(self.master_fd, f"{choice}\r".encode())
+        except OSError as e:
+            self.logger.error(f"[ModalAutoSkip] write failed: {e}")
+            return
+        self._startup_modal_handled = True
+        self._startup_modal_active = False
+        self._startup_buffer = bytearray()
+        self.logger.warning(
+            f"[ModalAutoSkip] Detected startup modal — auto-selected option {choice}"
+        )
 
     def run(self):
         """Main loop: PTY passthrough with FIFO injection."""
@@ -768,6 +920,9 @@ class ClawX:
                             os.write(stdout_fd, data)
                             transcript_f.write(data)
                             transcript_f.flush()
+                            # Watch for blocking startup modal (auto-compact
+                            # prompt under --continue) and auto-skip it.
+                            self._maybe_handle_startup_modal(data)
                         except OSError:
                             self.stop_event.set()
                             break
