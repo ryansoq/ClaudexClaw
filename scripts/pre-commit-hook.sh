@@ -9,7 +9,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 echo "[pre-commit] Running ClawX test suite..."
 
-python3 tests/test_clawx.py
+python3 -m pytest tests/ -q
 result=$?
 
 if [ $result -ne 0 ]; then
