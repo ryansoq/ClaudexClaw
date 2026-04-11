@@ -4,6 +4,7 @@ These exercise the regression-prone code paths that caused the
 2026-04-09→10 silent-scheduler incident. We mock the apscheduler
 BackgroundScheduler so tests stay fast and don't actually start threads.
 """
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -269,3 +270,95 @@ def test_maybe_handle_startup_modal_caps_buffer(stub_clawx):
     assert len(stub_clawx._startup_buffer) <= clawx.STARTUP_MODAL_BUFFER_LIMIT
     # No false positive.
     assert fake_os.writes == []
+
+
+# ── _send_telegram shared helper tests ──────────────────────────────
+
+def test_send_telegram_noop_without_chat_id(stub_clawx):
+    stub_clawx.config["compact_notify"] = {}
+    stub_clawx._send_telegram("test message")
+    stub_clawx.logger.error.assert_not_called()
+
+
+def test_send_telegram_noop_with_empty_telegram_config(stub_clawx):
+    stub_clawx.config["compact_notify"] = {"telegram": {}}
+    stub_clawx._send_telegram("test message")
+    stub_clawx.logger.error.assert_not_called()
+
+
+def test_notify_compact_delegates_to_send_telegram(stub_clawx):
+    with patch.object(stub_clawx, "_send_telegram") as mock_send:
+        stub_clawx._notify_compact()
+    mock_send.assert_called_once()
+    args = mock_send.call_args
+    assert "壓縮" in args[0][0] or "compact" in args[0][0].lower()
+
+
+def test_notify_rate_limit_delegates_to_send_telegram(stub_clawx):
+    with patch.object(stub_clawx, "_send_telegram") as mock_send:
+        stub_clawx._notify_rate_limit()
+    mock_send.assert_called_once()
+    args = mock_send.call_args
+    assert "rate limit" in args[0][0].lower() or "Token" in args[0][0]
+
+
+# ── Rate-limit cooldown tests ──────────────────────────────────────
+
+def test_rate_limit_uses_cooldown_not_one_shot(stub_clawx):
+    """Rate limit detection should use cooldown, allowing re-detection later."""
+    stub_clawx.master_fd = 99
+    stub_clawx._ratelimit_buffer = bytearray()
+    stub_clawx._ratelimit_cooldown_until = 0
+
+    fake_os = _FakeOS()
+    chunk = (
+        b"You've hit your limit\n"
+        b"/rate-limit-options\n"
+        b"  1. Stop and wait for limit to reset\n"
+        b"  2. Upgrade your plan\n"
+    )
+    with patch.object(clawx.os, "write", side_effect=fake_os.write), \
+         patch.object(stub_clawx, "_notify_rate_limit"):
+        stub_clawx._maybe_handle_rate_limit(chunk)
+
+    assert fake_os.writes == [(99, b"1\r")]
+    # Cooldown should be set (not a boolean flag)
+    assert stub_clawx._ratelimit_cooldown_until > 0
+
+
+def test_rate_limit_respects_cooldown(stub_clawx):
+    """During cooldown, rate limit detection should be skipped."""
+    import time as _time
+    stub_clawx.master_fd = 99
+    stub_clawx._ratelimit_buffer = bytearray()
+    stub_clawx._ratelimit_cooldown_until = _time.time() + 9999  # far future
+
+    fake_os = _FakeOS()
+    chunk = (
+        b"You've hit your limit\n"
+        b"/rate-limit-options\n"
+        b"  1. Stop and wait\n"
+        b"  2. Upgrade\n"
+    )
+    with patch.object(clawx.os, "write", side_effect=fake_os.write):
+        stub_clawx._maybe_handle_rate_limit(chunk)
+
+    assert fake_os.writes == []  # Skipped due to cooldown
+
+
+# ── Log rotation tests ─────────────────────────────────────────────
+
+def test_setup_logging_uses_rotating_handler(tmp_path):
+    from logging.handlers import RotatingFileHandler
+    cfg = {"logging": {"dir": str(tmp_path / "logs"), "max_size_mb": 10, "rotate_count": 3}}
+    logger = clawx.setup_logging(cfg)
+    rotating_handlers = [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]
+    assert len(rotating_handlers) >= 1
+    handler = rotating_handlers[-1]
+    assert handler.maxBytes == 10 * 1024 * 1024
+    assert handler.backupCount == 3
+    # Cleanup: remove handlers to avoid leaking between tests
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    for h in list(logging.getLogger("apscheduler").handlers):
+        logging.getLogger("apscheduler").removeHandler(h)

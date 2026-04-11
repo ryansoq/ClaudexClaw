@@ -159,10 +159,19 @@ def load_config():
         return json.load(f)
 
 
-def setup_logging():
+def setup_logging(config=None):
+    from logging.handlers import RotatingFileHandler
+
     LOG_DIR.mkdir(exist_ok=True)
     log_file = LOG_DIR / f"clawx-{datetime.now().strftime('%Y%m%d')}.log"
-    fh = logging.FileHandler(log_file, encoding="utf-8")
+
+    log_cfg = (config or {}).get("logging", {})
+    max_bytes = log_cfg.get("max_size_mb", 50) * 1024 * 1024
+    backup_count = log_cfg.get("rotate_count", 5)
+
+    fh = RotatingFileHandler(
+        log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8",
+    )
     fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] [%(levelname)s] %(message)s"))
 
     logger = logging.getLogger("ClawX")
@@ -198,7 +207,7 @@ class ClawX:
 
     def __init__(self):
         self.config = load_config()
-        self.logger = setup_logging()
+        self.logger = setup_logging(self.config)
         self.master_fd = None
         self.child_pid = None
         self.stop_event = Event()
@@ -216,7 +225,7 @@ class ClawX:
         self._startup_modal_handled = False
         # Rate-limit modal detection — runs continuously, not just at startup.
         self._ratelimit_buffer = bytearray()
-        self._ratelimit_handled = False
+        self._ratelimit_cooldown_until = 0  # epoch; prevent rapid re-fires
         # Compact detection via PTY stream (replaced JSONL-based CompactWatcher).
         self._compact_buffer = bytearray()
         self._compact_cooldown_until = 0  # epoch; suppress rapid re-fires
@@ -541,7 +550,6 @@ class ClawX:
         user via Telegram. A 60-second cooldown prevents rapid re-fires
         when the same message scrolls through the buffer multiple times.
         """
-        import time
         now = time.time()
         if now < self._compact_cooldown_until:
             return
@@ -557,7 +565,6 @@ class ClawX:
 
         # (1) Internal: restore identity after a short delay
         def _deferred_identity_reload():
-            import time
             time.sleep(3)
             self.inject(
                 "BLOCKING REQUIREMENT: Read AGENTS.md and follow its "
@@ -571,18 +578,17 @@ class ClawX:
         # (2) Public: notify user via Telegram
         self._notify_compact()
 
-    def _notify_compact(self):
-        """Send a user-friendly Telegram message about the auto-compact.
+    def _send_telegram(self, text, tag="Notify"):
+        """Send a Telegram message via Bot API. Best-effort, never crashes.
 
         Reads bot token from ~/.claude/channels/telegram/.env and chat_id
-        from config.json -> compact_notify.telegram.chat_id. Fails soft —
-        notification is best-effort and must never crash.
+        from config.json -> compact_notify.telegram.chat_id.
         """
         cfg = (self.config.get("compact_notify") or {})
         tg_cfg = (cfg.get("telegram") or {})
         chat_id = tg_cfg.get("chat_id")
         if not chat_id:
-            return  # notification not configured — silent no-op
+            return
 
         token_file = Path(tg_cfg.get(
             "token_env_file",
@@ -595,26 +601,31 @@ class ClawX:
                     token = line.split("=", 1)[1].strip().strip('"').strip("'")
                     break
         except OSError as e:
-            self.logger.warning(f"[Compact] could not read TG token: {e}")
+            self.logger.warning(f"[{tag}] could not read TG token: {e}")
             return
         if not token:
             return
-
-        body = "🧠 Context 自動壓縮了，正在重新載入身份…"
 
         try:
             import urllib.parse
             import urllib.request
             payload = urllib.parse.urlencode({
                 "chat_id": str(chat_id),
-                "text": body,
+                "text": text,
             }).encode("utf-8")
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             req = urllib.request.Request(url, data=payload, method="POST")
             with urllib.request.urlopen(req, timeout=5) as resp:
                 resp.read()
         except Exception as e:
-            self.logger.warning(f"[Compact] TG notify failed: {e}")
+            self.logger.warning(f"[{tag}] TG notify failed: {e}")
+
+    def _notify_compact(self):
+        """Send Telegram notification about auto-compact."""
+        self._send_telegram(
+            "🧠 Context 自動壓縮了，正在重新載入身份…",
+            tag="Compact",
+        )
 
     def _run_scheduled(self, name, prompt):
         """Execute a scheduled prompt by injecting into the PTY."""
@@ -699,7 +710,7 @@ class ClawX:
             self._startup_modal_handled = False
             # Reset rate-limit detection on respawn.
             self._ratelimit_buffer = bytearray()
-            self._ratelimit_handled = False
+            self._ratelimit_cooldown_until = 0
             # Reset compact detection on respawn.
             self._compact_buffer = bytearray()
             self._compact_cooldown_until = 0
@@ -755,7 +766,6 @@ class ClawX:
         # so Claude restores its identity in the new session.
         # Short delay lets Claude finish processing the modal selection.
         def _deferred_identity_reload():
-            import time
             time.sleep(3)
             self.inject(
                 "BLOCKING REQUIREMENT: Read AGENTS.md and follow its "
@@ -772,9 +782,10 @@ class ClawX:
         Unlike startup modal detection which only runs during the first
         60 seconds, rate limits can appear at any time. We keep a small
         rolling buffer of recent PTY output and check for the rate-limit
-        prompt pattern.
+        prompt pattern. A 5-minute cooldown prevents rapid re-fires.
         """
-        if self._ratelimit_handled:
+        now = time.time()
+        if now < self._ratelimit_cooldown_until:
             return
         self._ratelimit_buffer.extend(chunk)
         # Keep only the last 8KB — the prompt is small.
@@ -790,7 +801,7 @@ class ClawX:
         except OSError as e:
             self.logger.error(f"[RateLimit] write failed: {e}")
             return
-        self._ratelimit_handled = True
+        self._ratelimit_cooldown_until = now + 300  # 5 min cooldown
         self._ratelimit_buffer = bytearray()
         self.logger.warning(
             "[RateLimit] Detected rate-limit modal — auto-selected 'Stop and wait'"
@@ -800,47 +811,12 @@ class ClawX:
 
     def _notify_rate_limit(self):
         """Send Telegram notification when rate limit is hit."""
-        cfg = (self.config.get("compact_notify") or {})
-        tg_cfg = (cfg.get("telegram") or {})
-        chat_id = tg_cfg.get("chat_id")
-        if not chat_id:
-            return
-
-        token_file = Path(tg_cfg.get(
-            "token_env_file",
-            str(Path.home() / ".claude" / "channels" / "telegram" / ".env"),
-        )).expanduser()
-        token = None
-        try:
-            for line in token_file.read_text().splitlines():
-                if line.startswith("TELEGRAM_BOT_TOKEN="):
-                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-        except OSError as e:
-            self.logger.warning(f"[RateLimit] could not read TG token: {e}")
-            return
-        if not token:
-            return
-
-        body = (
+        self._send_telegram(
             "⚠️ Token 用完了！Claude Code 撞到 rate limit。\n"
             "已自動選擇「等待 reset」。\n"
-            f"預計 12:00 AM (Asia/Taipei) 重置。"
+            "預計 12:00 AM (Asia/Taipei) 重置。",
+            tag="RateLimit",
         )
-
-        try:
-            import urllib.parse
-            import urllib.request
-            payload = urllib.parse.urlencode({
-                "chat_id": str(chat_id),
-                "text": body,
-            }).encode("utf-8")
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            req = urllib.request.Request(url, data=payload, method="POST")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                resp.read()
-        except Exception as e:
-            self.logger.warning(f"[RateLimit] TG notify failed: {e}")
 
     def run(self):
         """Main loop: PTY passthrough with FIFO injection."""
@@ -976,13 +952,25 @@ class ClawX:
 
             transcript_f.close()
 
-            # Cleanup
+            # Cleanup: give child 5s to exit gracefully, then SIGKILL.
             if self.child_pid and self._is_alive():
                 os.kill(self.child_pid, signal.SIGTERM)
-                try:
-                    os.waitpid(self.child_pid, 0)
-                except ChildProcessError:
-                    pass
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    try:
+                        pid, _ = os.waitpid(self.child_pid, os.WNOHANG)
+                        if pid != 0:
+                            break
+                    except ChildProcessError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    # Still alive after timeout — force kill.
+                    try:
+                        os.kill(self.child_pid, signal.SIGKILL)
+                        os.waitpid(self.child_pid, 0)
+                    except (ProcessLookupError, ChildProcessError):
+                        pass
 
             if self.master_fd is not None:
                 os.close(self.master_fd)
