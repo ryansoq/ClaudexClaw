@@ -187,3 +187,75 @@ def test_rate_limit_keyword_wait_for_limit():
         b"  2. nah\n"
     )
     assert detect_rate_limit_modal(buf) == 1
+
+
+# ── False positive regression tests (from real transcripts) ─────
+
+def test_rate_limit_not_triggered_by_code_diff():
+    """Real transcript: test code containing rate-limit keywords in a diff."""
+    buf = (
+        b" 117 +    buf = (\n"
+        b' 118 +        ansi + b"You\'ve hit your limit" + reset + b"\\n"\n'
+        b' 119 +        b"/rate-limit-options\\n"\n'
+        b" 120 +        b\"  1. Stop and wait for limit to reset\\n\"\n"
+        b" 121 +        b\"  2. Upgrade your plan\\n\"\n"
+    )
+    assert detect_rate_limit_modal(buf) is None
+
+
+def test_startup_modal_not_triggered_by_code_diff():
+    """Real transcript: code diff with 'compact' keyword + line numbers."""
+    buf = (
+        b" 31 +def test_detects_three_option_compact_prompt():\n"
+        b" 32 +    buf = (\n"
+        b' 33 +        b"Auto-compact options:\\n"\n'
+        b' 34 +        b"  1. Compact now\\n"\n'
+        b' 35 +        b"  2. Summarize\\n"\n'
+        b' 36 +        b"  3. Leave alone\\n"\n'
+        b" 37 +    )\n"
+    )
+    assert detect_startup_modal(buf) is None
+
+
+def test_startup_modal_not_triggered_by_conversation_about_compact():
+    """Real transcript: discussing compact events in chat."""
+    buf = (
+        b"Ryan: compact happened 8 times in 2.5 days\n"
+        b"That's about 1. every 7-8 hours which is normal\n"
+        b"for heavy tool use sessions. 2. The death spiral\n"
+        b"theory was wrong.\n"
+    )
+    assert detect_startup_modal(buf) is None
+
+
+def test_rate_limit_still_detects_real_prompt():
+    """Real transcript: actual rate limit prompt from Claude."""
+    buf = (
+        b"You've hit your limit \xc2\xb7 resets 12am (Asia/Taipei)\n"
+        b"/upgrade or /extra-usage to finish what you're working on.\n\n"
+        b"  1. Stop and wait for limit to reset\n"
+        b"  2. Upgrade your plan\n"
+    )
+    assert detect_rate_limit_modal(buf) == 1
+
+
+def test_compact_not_triggered_by_code_diff():
+    """Real transcript: code diff discussing compact events."""
+    buf = (
+        b" 215 +        b\" 37 +    )\\n\"\n"
+        b" 216 +    )\n"
+        b" 217 + Conversation compacted\n"
+    )
+    assert detect_compact_event(buf) is None
+
+
+def test_startup_modal_still_detects_real_prompt():
+    """Real prompt: actual compact modal at session resume."""
+    buf = (
+        b"\xe2\x9c\xbb Conversation compacted (ctrl+o for history)\n\n"
+        b"Auto-compact prompt:\n"
+        b"  1. compact\n"
+        b"  2. summarize\n"
+        b"  3. skip\n"
+    )
+    assert detect_startup_modal(buf) == 3

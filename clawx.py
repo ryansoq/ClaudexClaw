@@ -85,7 +85,11 @@ def detect_startup_modal(buf: bytes):
 
     Strategy: ANSI-strip the buffer, require BOTH:
       1. A context keyword ("compact" / "summarize" / "auto-compact")
-      2. At least 2 distinct numbered options ("1." or "1)" form)
+      2. At least 2 distinct numbered options at start-of-line
+
+    To avoid false positives from code diffs and conversation text,
+    options must appear at line start (with optional whitespace) —
+    not embedded in diff line numbers like "117 +".
 
     Returns the highest option number detected (the conventional
     "skip / leave alone" slot in 3-option Claude prompts), or None
@@ -96,8 +100,12 @@ def detect_startup_modal(buf: bytes):
     text = _ANSI_RE.sub(b"", buf).decode("utf-8", errors="replace").lower()
     if not any(kw in text for kw in ("compact", "summarize", "auto-compact")):
         return None
+    # Reject if this looks like a code diff (line numbers like "117 +")
+    if re.search(r"\d{2,}\s*[+\-]", text):
+        return None
     numbers = set()
-    for match in re.finditer(r"(?:^|\s|\[)([1-9])[.)\]]", text, re.MULTILINE):
+    # Match options at line start: optional whitespace/cursor (> or ❯), then digit
+    for match in re.finditer(r"(?:^|\n)[\s>❯]*([1-9])[.)\]]", text):
         numbers.add(int(match.group(1)))
     if len(numbers) < 2:
         return None
@@ -114,15 +122,22 @@ def detect_compact_event(buf: bytes):
     output, so after stripping we match the words individually rather
     than as a contiguous phrase.
 
+    To avoid false positives from code diffs that discuss compact events,
+    we reject buffers that look like diff context (multi-digit line numbers
+    followed by +/-).
+
     Returns True if detected, None otherwise.
     """
     if not buf:
         return None
     # Replace ANSI sequences with a space so cursor-moves don't merge words.
     text = _ANSI_RE.sub(b" ", buf).decode("utf-8", errors="replace").lower()
-    if "conversation" in text and "compacted" in text:
-        return True
-    return None
+    if "conversation" not in text or "compacted" not in text:
+        return None
+    # Reject diff context: line numbers like "215 +" indicate code, not real events
+    if re.search(r"\d{2,}\s*[+\-]", text):
+        return None
+    return True
 
 
 def detect_rate_limit_modal(buf: bytes):
@@ -133,6 +148,10 @@ def detect_rate_limit_modal(buf: bytes):
         /rate-limit-options
         1. Stop and wait for limit to reset
         2. Upgrade your plan
+
+    To avoid false positives from code diffs containing these keywords
+    as string literals (e.g. b"rate-limit-options"), we require both a
+    keyword AND start-of-line numbered options, and reject diff context.
 
     Returns 1 (wait for reset) if detected, None otherwise.
     """
@@ -146,8 +165,12 @@ def detect_rate_limit_modal(buf: bytes):
         "wait for limit to reset",
     )):
         return None
+    # Reject if this looks like a code diff (line numbers like "117 +")
+    if re.search(r"\d{2,}\s*[+\-]", text):
+        return None
     numbers = set()
-    for match in re.finditer(r"(?:^|\s|\[)([1-9])[.)\]]", text, re.MULTILINE):
+    # Match options at line start: optional whitespace/cursor (> or ❯), then digit
+    for match in re.finditer(r"(?:^|\n)[\s>❯]*([1-9])[.)\]]", text):
         numbers.add(int(match.group(1)))
     if len(numbers) < 2:
         return None
