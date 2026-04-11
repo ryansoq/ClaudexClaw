@@ -178,6 +178,31 @@ def detect_rate_limit_modal(buf: bytes):
     return 1
 
 
+def detect_feedback_modal(buf: bytes):
+    """Detect Claude's session feedback modal in PTY output.
+
+    Claude Code occasionally shows:
+        How is Claude doing this session? (optional)
+        1: Bad  2: Fine  3: Good  0: Dismiss
+
+    This blocks the session until a choice is made. We auto-dismiss.
+
+    Returns 0 (Dismiss) if detected, None otherwise.
+    """
+    if not buf:
+        return None
+    text = _ANSI_RE.sub(b"", buf).decode("utf-8", errors="replace").lower()
+    if "how is claude doing" not in text:
+        return None
+    # Reject diff context
+    if re.search(r"\d{2,}\s*[+\-]", text):
+        return None
+    # Check for dismiss option (0: Dismiss)
+    if "dismiss" in text:
+        return 0
+    return None
+
+
 def load_config():
     with open(CONFIG_PATH, encoding="utf-8") as f:
         return json.load(f)
@@ -842,6 +867,19 @@ class ClawX:
         msg = f"⚠️ Rate limit hit — auto-selected 'wait for reset'\n\n{clean}" if clean else "⚠️ Rate limit hit — auto-selected 'wait for reset'"
         self._send_telegram(msg, tag="RateLimit")
 
+    def _maybe_handle_feedback_modal(self, chunk):
+        """Detect and auto-dismiss Claude's session feedback modal."""
+        choice = detect_feedback_modal(chunk)
+        if choice is None:
+            return
+        try:
+            with self.write_lock:
+                os.write(self.master_fd, f"{choice}\r".encode())
+        except OSError as e:
+            self.logger.error(f"[Feedback] write failed: {e}")
+            return
+        self.logger.info("[Feedback] Auto-dismissed session feedback modal")
+
     def run(self):
         """Main loop: PTY passthrough with FIFO injection."""
         # Setup
@@ -965,6 +1003,7 @@ class ClawX:
                             self._maybe_handle_startup_modal(data)
                             self._maybe_handle_compact(data)
                             self._maybe_handle_rate_limit(data)
+                            self._maybe_handle_feedback_modal(data)
                         except OSError:
                             self.stop_event.set()
                             break

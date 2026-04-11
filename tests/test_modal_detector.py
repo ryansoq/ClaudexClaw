@@ -5,7 +5,7 @@ false positive types a stray digit into Claude, a false negative leaves
 the session wedged forever. So we test it with realistic-shaped fixtures
 covering the happy path, ANSI noise, and a few negative cases.
 """
-from clawx import detect_startup_modal, detect_compact_event, detect_rate_limit_modal
+from clawx import detect_startup_modal, detect_compact_event, detect_rate_limit_modal, detect_feedback_modal
 
 
 def test_returns_none_on_empty():
@@ -247,6 +247,48 @@ def test_compact_not_triggered_by_code_diff():
         b" 217 + Conversation compacted\n"
     )
     assert detect_compact_event(buf) is None
+
+
+# ── Feedback modal detector tests ───────────────────────────────
+
+def test_feedback_returns_none_on_empty():
+    assert detect_feedback_modal(b"") is None
+
+
+def test_feedback_returns_none_on_plain_text():
+    assert detect_feedback_modal(b"hello world\n> ") is None
+
+
+def test_feedback_detects_standard_prompt():
+    buf = (
+        b"How is Claude doing this session? (optional)\n"
+        b"  1: Bad  2: Fine  3: Good  0: Dismiss\n"
+    )
+    assert detect_feedback_modal(buf) == 0
+
+
+def test_feedback_detects_with_ansi():
+    ansi = b"\x1b[1;36m"
+    reset = b"\x1b[0m"
+    buf = (
+        ansi + b"How is Claude doing this session?" + reset + b" (optional)\n"
+        b"  1: Bad  2: Fine  3: Good  0: Dismiss\n"
+    )
+    assert detect_feedback_modal(buf) == 0
+
+
+def test_feedback_not_triggered_by_code_diff():
+    buf = (
+        b" 42 +    # How is Claude doing this session?\n"
+        b" 43 +    assert result == 0  # Dismiss\n"
+    )
+    assert detect_feedback_modal(buf) is None
+
+
+def test_feedback_not_triggered_by_conversation():
+    buf = b"Ryan asked how is claude doing this session and I said fine\n"
+    # No "dismiss" option → None
+    assert detect_feedback_modal(buf) is None
 
 
 def test_startup_modal_still_detects_real_prompt():
