@@ -20,6 +20,7 @@ Usage:
     python clawx.py stop             # Gracefully stop session
     python clawx.py restart          # Self-restart: stop then relaunch in same terminal
     python clawx.py prompt "text"    # One-shot: run prompt via -p mode, print result
+    python clawx.py replay <file>    # Parse transcript log, annotate events, output clean text
 """
 
 import json
@@ -1046,6 +1047,55 @@ def self_restart():
     return True
 
 
+def replay_transcript(path):
+    """Parse a transcript log, strip ANSI, detect and annotate events.
+
+    Outputs clean text with [EVENT] markers for compact, rate-limit, and
+    startup modal detections. Useful for analysing past sessions and
+    improving detection patterns.
+    """
+    p = Path(path)
+    if not p.exists():
+        print(f"Error: file not found: {path}")
+        sys.exit(1)
+
+    raw = p.read_bytes()
+    # Strip ANSI escape sequences
+    clean = _ANSI_RE.sub(b"", raw)
+    text = clean.decode("utf-8", errors="replace")
+
+    # Scan for events in sliding windows over the raw bytes
+    events = []
+    window = 8192
+    for i in range(0, len(raw), window // 2):
+        chunk = raw[i:i + window]
+        if detect_compact_event(chunk):
+            events.append((i, "COMPACT"))
+        if detect_rate_limit_modal(chunk):
+            events.append((i, "RATE_LIMIT"))
+        if detect_startup_modal(chunk):
+            events.append((i, "STARTUP_MODAL"))
+
+    # Deduplicate nearby events of same type
+    deduped = []
+    for offset, etype in events:
+        if deduped and deduped[-1][1] == etype and offset - deduped[-1][0] < window:
+            continue
+        deduped.append((offset, etype))
+
+    # Summary
+    print(f"=== Transcript Replay: {p.name} ===")
+    print(f"Size: {len(raw):,} bytes ({len(text):,} chars clean)")
+    print(f"Events detected: {len(deduped)}")
+    for offset, etype in deduped:
+        # Find approximate line context
+        nearby = _ANSI_RE.sub(b"", raw[max(0, offset - 200):offset + 500])
+        snippet = nearby.decode("utf-8", errors="replace").strip()[:200]
+        print(f"\n  [{etype}] at byte ~{offset}")
+        print(f"    ...{snippet}...")
+    print(f"\n=== End ({p.name}) ===")
+
+
 def main():
     if len(sys.argv) < 2:
         # Default: run PTY passthrough with restart loop
@@ -1093,6 +1143,9 @@ def main():
                 PID_FILE.unlink()
         else:
             print("No PID file found")
+
+    elif command == "replay" and len(sys.argv) > 2:
+        replay_transcript(sys.argv[2])
 
     elif command == "restart":
         self_restart()
