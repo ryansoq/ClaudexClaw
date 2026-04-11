@@ -275,6 +275,7 @@ class ClawX:
         # Rate-limit modal detection — runs continuously, not just at startup.
         self._ratelimit_buffer = bytearray()
         self._ratelimit_cooldown_until = 0  # epoch; prevent rapid re-fires
+        self._feedback_cooldown_until = 0   # epoch; prevent feedback loop
         # Compact detection via PTY stream (replaced JSONL-based CompactWatcher).
         self._compact_buffer = bytearray()
         self._compact_cooldown_until = 0  # epoch; suppress rapid re-fires
@@ -869,6 +870,9 @@ class ClawX:
 
     def _maybe_handle_feedback_modal(self, chunk):
         """Detect and auto-dismiss Claude's session feedback modal."""
+        now = time.time()
+        if now < self._feedback_cooldown_until:
+            return
         choice = detect_feedback_modal(chunk)
         if choice is None:
             return
@@ -878,6 +882,7 @@ class ClawX:
         except OSError as e:
             self.logger.error(f"[Feedback] write failed: {e}")
             return
+        self._feedback_cooldown_until = now + 300  # 5 min cooldown
         self.logger.info("[Feedback] Auto-dismissed session feedback modal")
 
     def run(self):
