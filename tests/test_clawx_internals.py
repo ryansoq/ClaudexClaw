@@ -296,10 +296,10 @@ def test_notify_compact_delegates_to_send_telegram(stub_clawx):
 
 def test_notify_rate_limit_delegates_to_send_telegram(stub_clawx):
     with patch.object(stub_clawx, "_send_telegram") as mock_send:
-        stub_clawx._notify_rate_limit()
+        stub_clawx._notify_rate_limit("You've hit your limit")
     mock_send.assert_called_once()
     args = mock_send.call_args
-    assert "rate limit" in args[0][0].lower() or "Token" in args[0][0]
+    assert "rate limit" in args[0][0].lower() or "hit your limit" in args[0][0].lower()
 
 
 # ── Rate-limit cooldown tests ──────────────────────────────────────

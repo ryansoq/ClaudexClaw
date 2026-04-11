@@ -802,21 +802,21 @@ class ClawX:
             self.logger.error(f"[RateLimit] write failed: {e}")
             return
         self._ratelimit_cooldown_until = now + 300  # 5 min cooldown
+        raw_text = self._ratelimit_buffer.decode("utf-8", errors="replace").strip()
         self._ratelimit_buffer = bytearray()
         self.logger.warning(
             "[RateLimit] Detected rate-limit modal — auto-selected 'Stop and wait'"
         )
-        # Notify user via Telegram
-        self._notify_rate_limit()
+        # Notify user via Telegram — forward Claude's raw message
+        self._notify_rate_limit(raw_text)
 
-    def _notify_rate_limit(self):
+    def _notify_rate_limit(self, raw_text=""):
         """Send Telegram notification when rate limit is hit."""
-        self._send_telegram(
-            "⚠️ Token 用完了！Claude Code 撞到 rate limit。\n"
-            "已自動選擇「等待 reset」。\n"
-            "預計 12:00 AM (Asia/Taipei) 重置。",
-            tag="RateLimit",
-        )
+        import re
+        # Strip ANSI escape codes for clean TG message
+        clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw_text).strip() if raw_text else ""
+        msg = f"⚠️ Rate limit hit — auto-selected 'wait for reset'\n\n{clean}" if clean else "⚠️ Rate limit hit — auto-selected 'wait for reset'"
+        self._send_telegram(msg, tag="RateLimit")
 
     def run(self):
         """Main loop: PTY passthrough with FIFO injection."""
