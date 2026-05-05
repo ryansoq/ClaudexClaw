@@ -14,6 +14,7 @@ from clawx import (
     detect_rate_limit_modal,
     detect_feedback_modal,
     detect_resume_modal,
+    detect_permission_prompt,
 )
 
 import pytest
@@ -569,3 +570,57 @@ def test_resume_diff_guard_still_rejects_real_code_diff():
         b" 119 +    if '  3. don't ask me again' in text:\n"
     )
     assert detect_resume_modal(buf) is None
+
+
+# ── Permission prompt detector tests ──────────────────────────
+
+def test_permission_returns_none_on_empty():
+    assert detect_permission_prompt(b"") is None
+
+
+def test_permission_returns_none_on_plain_text():
+    assert detect_permission_prompt(b"hello world\n> ") is None
+
+
+def test_permission_detects_standard_prompt():
+    buf = (
+        b"crontab -l\n\n"
+        b"Do you want to proceed?\n"
+        b"  1. Yes\n"
+        b"  2. Yes, and don't ask again for crontab\n"
+        b"  3. No, and tell Claude what to do differently\n"
+    )
+    cmd = detect_permission_prompt(buf)
+    assert cmd is not None
+    assert "crontab" in cmd
+
+
+def test_permission_detects_with_ansi():
+    ansi = b"\x1b[1;36m"
+    reset = b"\x1b[0m"
+    buf = (
+        b"bash -c 'rm -rf /tmp/x'\n\n"
+        + ansi + b"Do you want to proceed?" + reset + b"\n"
+        b"  1. Yes\n"
+        b"  2. Yes, and don't ask again\n"
+    )
+    cmd = detect_permission_prompt(buf)
+    assert cmd is not None
+    assert "rm" in cmd or "bash" in cmd
+
+
+def test_permission_not_triggered_by_question_alone():
+    """Without the option list, plain prose mentioning the phrase shouldn't match."""
+    buf = b"do you want to proceed? asked Ryan in a meeting\n"
+    assert detect_permission_prompt(buf) is None
+
+
+def test_permission_falls_back_when_no_command_extractable():
+    buf = (
+        b"Do you want to proceed?\n"
+        b"  1. Yes\n"
+        b"  2. Yes, and don't ask again\n"
+    )
+    # Lower-case "do you want to proceed" + 1. yes → match, but no command line
+    cmd = detect_permission_prompt(buf)
+    assert cmd == "<unknown command>"

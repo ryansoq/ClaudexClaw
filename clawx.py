@@ -335,6 +335,44 @@ def detect_resume_modal(buf: bytes):
     return 3
 
 
+def detect_permission_prompt(buf: bytes):
+    """Detect Claude Code's permission prompt for tool approval.
+
+    Claude shows it like:
+        Bash command (some text)
+        Do you want to proceed?
+        ❯ 1. Yes
+          2. Yes, and don't ask again for ...
+          3. No, and tell Claude what to do differently (esc)
+
+    Returns the (best-effort) bash command preview if detected, else None.
+    Even with --dangerously-skip-permissions some chained / sensitive commands
+    still prompt; auto-approving by sending "1\\r" matches user's "max
+    permission" intent.
+    """
+    if not buf:
+        return None
+    text = _ANSI_RE.sub(b"", buf).decode("utf-8", errors="replace")
+    lower = text.lower()
+    if "do you want to proceed?" not in lower:
+        return None
+    if "yes, and don't ask again" not in lower and "1. yes" not in lower:
+        return None
+    # Try to extract the command preview from the text before the prompt.
+    cmd_preview = ""
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if "do you want to proceed" in s.lower():
+            break
+        if s.startswith(("1.", "2.", "3.", "❯", "─", "│", "╭", "╰")):
+            continue
+        if len(s) > 4:
+            cmd_preview = s[:200]
+    return cmd_preview or "<unknown command>"
+
+
 def detect_feedback_modal(buf: bytes):
     """Detect Claude's session feedback modal in PTY output.
 
@@ -444,6 +482,12 @@ class ClawX:
         self._feedback_cooldown_until = 0   # epoch; prevent feedback loop
         self._resume_cooldown_until = 0     # epoch; prevent resume-modal loop
         self._resume_buffer = bytearray()   # accumulator for multi-chunk modal
+        # Permission prompt detection — Claude Code sometimes prompts for tool
+        # approval even with --dangerously-skip-permissions (e.g. crontab,
+        # chained && bash). When detected: notify user on TG + auto-approve
+        # default option (matches user intent of "max permission" mode).
+        self._permission_cooldown_until = 0
+        self._permission_buffer = bytearray()
         # Compact detection via PTY stream (replaced JSONL-based CompactWatcher).
         self._compact_buffer = bytearray()
         self._compact_cooldown_until = 0  # epoch; suppress rapid re-fires
@@ -1362,6 +1406,49 @@ class ClawX:
         self._feedback_cooldown_until = now + 300  # 5 min cooldown
         self.logger.info("[Feedback] Auto-dismissed session feedback modal (Esc)")
 
+    def _maybe_handle_permission_prompt(self, chunk):
+        """Detect Claude's tool-approval prompt and auto-approve.
+
+        Claude Code occasionally shows a permission prompt even with
+        --dangerously-skip-permissions (crontab, chained &&, certain MCP
+        tools). When detected:
+          1. Send TG notification so user sees what's being approved
+          2. Inject "1\\r" to select option 1 = Yes
+          3. 30s cooldown to avoid re-firing on the same modal
+
+        Defaults ON; opt out with config.permission_relay.enabled=false.
+        Pattern: detect on accumulated buffer (modal text spans multiple
+        chunks like resume modal).
+        """
+        cfg = (self.config.get("permission_relay") or {})
+        if cfg.get("enabled") is False:  # explicit opt-out
+            return
+        now = time.time()
+        if now < self._permission_cooldown_until:
+            return
+        self._permission_buffer.extend(chunk)
+        if len(self._permission_buffer) > 8192:
+            del self._permission_buffer[:-8192]
+        cmd_preview = detect_permission_prompt(bytes(self._permission_buffer))
+        if cmd_preview is None:
+            return
+        # Notify user via TG before injecting (transparency over surprise)
+        self._send_telegram(
+            f"🔐 Permission auto-approved by ClawX:\n\n{cmd_preview}",
+            tag="PermissionRelay",
+        )
+        try:
+            with self.write_lock:
+                os.write(self.master_fd, b"1\r")
+        except OSError as e:
+            self.logger.error(f"[PermissionRelay] write failed: {e}")
+            return
+        self._permission_buffer = bytearray()
+        self._permission_cooldown_until = now + 30  # 30s cooldown
+        self.logger.info(
+            f"[PermissionRelay] Auto-approved tool prompt: {cmd_preview[:80]}"
+        )
+
     def _maybe_handle_resume_modal(self, chunk):
         """Detect and auto-select 'Don't ask me again' on the resume-mode modal.
 
@@ -1512,6 +1599,7 @@ class ClawX:
                             self._maybe_handle_rate_limit(data)
                             self._maybe_handle_feedback_modal(data)
                             self._maybe_handle_resume_modal(data)
+                            self._maybe_handle_permission_prompt(data)
                         except OSError:
                             self.stop_event.set()
                             break
