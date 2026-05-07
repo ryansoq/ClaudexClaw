@@ -603,6 +603,7 @@ def test_permission_detects_with_ansi():
         + ansi + b"Do you want to proceed?" + reset + b"\n"
         b"  1. Yes\n"
         b"  2. Yes, and don't ask again\n"
+        b"  3. No, cancel\n"
     )
     cmd = detect_permission_prompt(buf)
     assert cmd is not None
@@ -620,7 +621,35 @@ def test_permission_falls_back_when_no_command_extractable():
         b"Do you want to proceed?\n"
         b"  1. Yes\n"
         b"  2. Yes, and don't ask again\n"
+        b"  3. No, and tell Claude what to do differently\n"
     )
-    # Lower-case "do you want to proceed" + 1. yes → match, but no command line
+    # Header "Do you want to proceed?" gets skipped, no other content
+    # before option list → falls back to default sentinel.
     cmd = detect_permission_prompt(buf)
-    assert cmd == "<unknown command>"
+    assert cmd == "<permission prompt>"
+
+
+def test_permission_detects_alternative_wording():
+    """New broader detection — any "1. Yes/Allow/Proceed" + "2-3. No/..."
+    list counts, regardless of the header wording."""
+    buf = (
+        b"Run command 'kill 1234'?\n"
+        b"  1. Allow\n"
+        b"  3. No, cancel\n"
+    )
+    cmd = detect_permission_prompt(buf)
+    assert cmd is not None
+    assert "kill" in cmd or "Run command" in cmd
+
+
+def test_permission_diff_guard_rejects_diff_context():
+    """Diff context like ' 342 +    1. Yes' should NOT trigger detection
+    even though regex shape matches — git diff lines are common in chat."""
+    buf = (
+        b"Diff:\n"
+        b" 342 +    Bash command (some text)\n"
+        b" 343 +    Do you want to proceed?\n"
+        b" 344 +    1. Yes\n"
+        b" 345 +    3. No, cancel\n"
+    )
+    assert detect_permission_prompt(buf) is None

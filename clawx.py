@@ -335,42 +335,63 @@ def detect_resume_modal(buf: bytes):
     return 3
 
 
+_PERMISSION_OPTION_RE = re.compile(
+    r"(?im)^\s*[❯>]?\s*1\.\s*(yes|allow|proceed|approve)\b"
+)
+_PERMISSION_NEG_OPTION_RE = re.compile(
+    r"(?im)^\s*[❯>]?\s*[23]\.\s*(no|reject|deny|cancel|skip|stop|don'?t)\b"
+)
+_DOCSTRING_GUARD_RE = re.compile(
+    r'^\s*\d+\s+[-+]\s', re.MULTILINE
+)
+
+
 def detect_permission_prompt(buf: bytes):
     """Detect Claude Code's permission prompt for tool approval.
 
-    Claude shows it like:
-        Bash command (some text)
-        Do you want to proceed?
-        ❯ 1. Yes
-          2. Yes, and don't ask again for ...
-          3. No, and tell Claude what to do differently (esc)
+    Heuristic — looks for a numbered option list (1. Yes / 2. Yes, … /
+    3. No, …) regardless of the exact prompt header text. This is broader
+    than the original "do you want to proceed?" check, which missed CLI
+    versions that use different wording.
 
-    Returns the (best-effort) bash command preview if detected, else None.
-    Even with --dangerously-skip-permissions some chained / sensitive commands
-    still prompt; auto-approving by sending "1\\r" matches user's "max
-    permission" intent.
+    Guards against false positives:
+      - skip text that looks like a code diff (`123 +    1. Yes`)
+      - require BOTH a positive option-1 AND a negative option-2-or-3
+        on separate lines (rules out single bullets in narrative text)
+
+    Returns command preview string if detected, else None.
     """
     if not buf:
         return None
     text = _ANSI_RE.sub(b"", buf).decode("utf-8", errors="replace")
-    lower = text.lower()
-    if "do you want to proceed?" not in lower:
+    if _DOCSTRING_GUARD_RE.search(text):
+        non_diff_text = []
+        for line in text.splitlines():
+            if not re.match(r'^\s*\d+\s+[-+]\s', line):
+                non_diff_text.append(line)
+        text = "\n".join(non_diff_text)
+    pos_match = _PERMISSION_OPTION_RE.search(text)
+    neg_match = _PERMISSION_NEG_OPTION_RE.search(text)
+    if not (pos_match and neg_match):
         return None
-    if "yes, and don't ask again" not in lower and "1. yes" not in lower:
-        return None
-    # Try to extract the command preview from the text before the prompt.
+    pos_line_idx = text[: pos_match.start()].count("\n")
     cmd_preview = ""
-    for line in text.splitlines():
+    for i, line in enumerate(text.splitlines()):
+        if i >= pos_line_idx:
+            break
         s = line.strip()
         if not s:
             continue
-        if "do you want to proceed" in s.lower():
-            break
         if s.startswith(("1.", "2.", "3.", "❯", "─", "│", "╭", "╰")):
             continue
-        if len(s) > 4:
+        sl = s.lower()
+        if s.endswith("?") and any(
+            kw in sl for kw in (
+                "do you want", "proceed", "approve", "allow", "permission")):
+            continue
+        if len(s) > 4 and len(s) > len(cmd_preview):
             cmd_preview = s[:200]
-    return cmd_preview or "<unknown command>"
+    return cmd_preview or "<permission prompt>"
 
 
 def detect_feedback_modal(buf: bytes):
