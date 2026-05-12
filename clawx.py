@@ -70,6 +70,16 @@ FIFO_PATH = BASE_DIR / "mono.fifo"
 LOG_DIR = BASE_DIR / "logs"
 RESTART_EXIT_CODE = 42
 
+# Min seconds between back-to-back inject() calls. When multiple cron
+# jobs fire within milliseconds of each other (the 2026-05-09 morning
+# report failure: ema530-morning-report + heartbeat + nami-lm-loop
+# all on the 0 8 boundary, fired 153ms / 305ms apart), back-to-back
+# Ctrl+U + new prompt sequences wipe Claude's input box and interrupt
+# the previous response before it can complete. Holding 30s gives
+# Claude room to start the response (and for short replies, finish
+# them) before the next prompt lands.
+INJECT_GAP_SECONDS = float(os.environ.get("CLAWX_INJECT_GAP_SECONDS", "30"))
+
 # Modal-prompt detection: strip ANSI escape sequences before pattern matching
 # so colored TUI output doesn't fool the detector.
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]")
@@ -364,7 +374,13 @@ def detect_permission_prompt(buf: bytes):
     if not buf:
         return None
     text = _ANSI_RE.sub(b"", buf).decode("utf-8", errors="replace")
+    # Diff-context guard: lines like "342 +    1. Yes" should never count
     if _DOCSTRING_GUARD_RE.search(text):
+        # If most "1./2./3." matches are in diff context, treat as code, not modal.
+        # Diff lines like "342 -    Bash command" or "342 +    1. Yes"
+        # are git diff format from gh / git rendering — strip them out
+        # before pattern matching, since they're docstring content not
+        # an actual modal.
         non_diff_text = []
         for line in text.splitlines():
             if not re.match(r'^\s*\d+\s+[-+]\s', line):
@@ -374,6 +390,8 @@ def detect_permission_prompt(buf: bytes):
     neg_match = _PERMISSION_NEG_OPTION_RE.search(text)
     if not (pos_match and neg_match):
         return None
+    # Extract command preview: take the longest non-option, non-empty line
+    # appearing before the option list.
     pos_line_idx = text[: pos_match.start()].count("\n")
     cmd_preview = ""
     for i, line in enumerate(text.splitlines()):
@@ -384,6 +402,9 @@ def detect_permission_prompt(buf: bytes):
             continue
         if s.startswith(("1.", "2.", "3.", "❯", "─", "│", "╭", "╰")):
             continue
+        # Skip the prompt header itself ("Do you want to proceed?" etc).
+        # Heuristic: prompt headers usually end with "?" and contain
+        # english words like "want / proceed / approve".
         sl = s.lower()
         if s.endswith("?") and any(
             kw in sl for kw in (
@@ -483,6 +504,10 @@ class ClawX:
         self.child_pid = None
         self.stop_event = Event()
         self.write_lock = Lock()
+        # Separate lock so inject's debounce sleep doesn't block the
+        # write_lock-protected Esc/keystroke paths used for modal dismissal.
+        self._inject_gap_lock = Lock()
+        self._last_inject_ts = 0.0
         self.started_at = None
         self.scheduler = None
         self.restart_count = 0
@@ -505,7 +530,7 @@ class ClawX:
         self._resume_buffer = bytearray()   # accumulator for multi-chunk modal
         # Permission prompt detection — Claude Code sometimes prompts for tool
         # approval even with --dangerously-skip-permissions (e.g. crontab,
-        # chained && bash). When detected: notify user on TG + auto-approve
+        # chained && bash). When detected: notify Ryan on TG + auto-approve
         # default option (matches user intent of "max permission" mode).
         self._permission_cooldown_until = 0
         self._permission_buffer = bytearray()
@@ -597,21 +622,31 @@ class ClawX:
         if self.master_fd is None:
             self.logger.error("No active session")
             return False
-        with self.write_lock:
-            try:
-                os.write(self.master_fd, b"\x15")  # clear input line
-                time.sleep(0.05)
-                os.write(self.master_fd, text.encode("utf-8"))
-                time.sleep(0.1)
-                os.write(self.master_fd, b"\r")
-                # Log the redacted preview — full payload still went to
-                # the PTY above, this is just to keep secrets out of
-                # plaintext logs (logs/clawx-*.log is world-readable).
-                self.logger.info(f"[Inject] {redact_secrets(text[:200])}")
-                return True
-            except Exception as e:
-                self.logger.error(f"[Inject] Failed: {e}")
-                return False
+        # Debounce back-to-back injects (see INJECT_GAP_SECONDS rationale).
+        # The gap lock is separate from write_lock so its sleep doesn't
+        # block modal-dismissal Esc keystrokes that also use write_lock.
+        with self._inject_gap_lock:
+            elapsed = time.monotonic() - self._last_inject_ts
+            if elapsed < INJECT_GAP_SECONDS:
+                sleep_for = INJECT_GAP_SECONDS - elapsed
+                self.logger.info(f"[Inject] debounce {sleep_for:.1f}s")
+                time.sleep(sleep_for)
+            with self.write_lock:
+                try:
+                    os.write(self.master_fd, b"\x15")  # clear input line
+                    time.sleep(0.05)
+                    os.write(self.master_fd, text.encode("utf-8"))
+                    time.sleep(0.1)
+                    os.write(self.master_fd, b"\r")
+                    # Log the redacted preview — full payload still went to
+                    # the PTY above, this is just to keep secrets out of
+                    # plaintext logs (logs/clawx-*.log is world-readable).
+                    self.logger.info(f"[Inject] {redact_secrets(text[:200])}")
+                    self._last_inject_ts = time.monotonic()
+                    return True
+                except Exception as e:
+                    self.logger.error(f"[Inject] Failed: {e}")
+                    return False
 
     def _setup_fifo(self):
         """Create FIFO for external injection."""
@@ -1433,7 +1468,7 @@ class ClawX:
         Claude Code occasionally shows a permission prompt even with
         --dangerously-skip-permissions (crontab, chained &&, certain MCP
         tools). When detected:
-          1. Send TG notification so user sees what's being approved
+          1. Send TG notification so Ryan sees what's being approved
           2. Inject "1\\r" to select option 1 = Yes
           3. 30s cooldown to avoid re-firing on the same modal
 
@@ -1453,7 +1488,7 @@ class ClawX:
         cmd_preview = detect_permission_prompt(bytes(self._permission_buffer))
         if cmd_preview is None:
             return
-        # Notify user via TG before injecting (transparency over surprise)
+        # Notify Ryan via TG before injecting (transparency over surprise)
         self._send_telegram(
             f"🔐 Permission auto-approved by ClawX:\n\n{cmd_preview}",
             tag="PermissionRelay",

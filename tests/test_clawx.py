@@ -73,6 +73,9 @@ def launch_clawx(workdir, mock_log):
     env = os.environ.copy()
     env["MOCK_LOG"] = str(mock_log)
     env["PYTHONUNBUFFERED"] = "1"
+    # Tests fire bursts of injects; A2 debounce (30s default) would block
+    # the rapid-inject test. Override to 0 so tests see immediate delivery.
+    env["CLAWX_INJECT_GAP_SECONDS"] = "0"
     proc = subprocess.Popen(
         [sys.executable, str(workdir / "clawx.py")],
         cwd=str(workdir),
