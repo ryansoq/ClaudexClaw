@@ -530,7 +530,7 @@ class ClawX:
         self._resume_buffer = bytearray()   # accumulator for multi-chunk modal
         # Permission prompt detection — Claude Code sometimes prompts for tool
         # approval even with --dangerously-skip-permissions (e.g. crontab,
-        # chained && bash). When detected: notify Ryan on TG + auto-approve
+        # chained && bash). When detected: notify the user on TG + auto-approve
         # default option (matches user intent of "max permission" mode).
         self._permission_cooldown_until = 0
         self._permission_buffer = bytearray()
@@ -1443,7 +1443,7 @@ class ClawX:
         Previously auto-wrote "0\\r" — but Ink's TUI keeps input focus on
         the prompt textbox while the modal is overlaid, so the keystroke
         landed in the prompt and "0" got submitted as a user message
-        (Ryan saw 9+ stray "0"s through 2026-04-18 morning). Esc is a
+        (we saw 9+ stray "0"s through 2026-04-18 morning). Esc is a
         non-printable control char: Ink typically routes it to the modal
         layer to dismiss; if it leaks to the prompt textbox it's a no-op
         (TextInput treats Esc as cancel, no character inserted).
@@ -1468,7 +1468,7 @@ class ClawX:
         Claude Code occasionally shows a permission prompt even with
         --dangerously-skip-permissions (crontab, chained &&, certain MCP
         tools). When detected:
-          1. Send TG notification so Ryan sees what's being approved
+          1. Send TG notification so the user sees what's being approved
           2. Inject "1\\r" to select option 1 = Yes
           3. 30s cooldown to avoid re-firing on the same modal
 
@@ -1488,7 +1488,7 @@ class ClawX:
         cmd_preview = detect_permission_prompt(bytes(self._permission_buffer))
         if cmd_preview is None:
             return
-        # Notify Ryan via TG before injecting (transparency over surprise)
+        # Notify the user via TG before injecting (transparency over surprise)
         self._send_telegram(
             f"🔐 Permission auto-approved by ClawX:\n\n{cmd_preview}",
             tag="PermissionRelay",
