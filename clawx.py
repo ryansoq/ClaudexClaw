@@ -89,7 +89,7 @@ INJECT_GAP_SECONDS = float(os.environ.get("CLAWX_INJECT_GAP_SECONDS", "30"))
 # output, meaning Claude isn't actively streaming a response or running a
 # tool). Defaults: off (preserves current behavior); set
 # CLAWX_QUEUE_ENABLED=1 to opt in.
-QUEUE_ENABLED = os.environ.get("CLAWX_QUEUE_ENABLED", "0") == "1"
+QUEUE_ENABLED = os.environ.get("CLAWX_QUEUE_ENABLED", "1") == "1"
 QUEUE_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_IDLE_SECONDS", "5.0"))
 QUEUE_MAX_DEPTH = int(os.environ.get("CLAWX_QUEUE_MAX_DEPTH", "10"))
 
