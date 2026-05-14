@@ -43,6 +43,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from threading import Thread, Event, Lock
+from collections import deque
 
 # Required: scheduling is core to ClawX (heartbeat, cron jobs).
 # Hard-fail at startup if apscheduler is missing so users don't silently
@@ -79,6 +80,18 @@ RESTART_EXIT_CODE = 42
 # Claude room to start the response (and for short replies, finish
 # them) before the next prompt lands.
 INJECT_GAP_SECONDS = float(os.environ.get("CLAWX_INJECT_GAP_SECONDS", "30"))
+
+# Queued-inject mode (2026-05-14) — solves the prompt-collision bug where
+# cron/heartbeat injects during in-flight bash cancel the bash and return
+# "user doesn't want to proceed" to the Claude session. When enabled,
+# scheduled prompts go into a FIFO queue; a drain thread pops one and
+# injects only when PTY has been idle for CLAWX_QUEUE_IDLE_SECONDS (no new
+# output, meaning Claude isn't actively streaming a response or running a
+# tool). Defaults: off (preserves current behavior); set
+# CLAWX_QUEUE_ENABLED=1 to opt in.
+QUEUE_ENABLED = os.environ.get("CLAWX_QUEUE_ENABLED", "0") == "1"
+QUEUE_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_IDLE_SECONDS", "5.0"))
+QUEUE_MAX_DEPTH = int(os.environ.get("CLAWX_QUEUE_MAX_DEPTH", "10"))
 
 # Modal-prompt detection: strip ANSI escape sequences before pattern matching
 # so colored TUI output doesn't fool the detector.
@@ -540,6 +553,14 @@ class ClawX:
         # SIGHUP defers to _health_loop — handler must not block on
         # config I/O / scheduler lock while main loop holds write_lock.
         self._reload_requested = False
+        # Queued-inject (2026-05-14) — see QUEUE_ENABLED docs.
+        # Scheduler callbacks push (timestamp, name, prompt) tuples; drain
+        # thread pops only when PTY has been idle for QUEUE_IDLE_SECONDS.
+        # Off by default (legacy behavior preserved); env CLAWX_QUEUE_ENABLED=1
+        # to turn on.
+        self._inject_queue = deque()
+        self._inject_queue_lock = Lock()
+        self._pty_last_output_at = time.monotonic()
 
     def build_command(self):
         """Build the claude CLI command."""
@@ -1211,12 +1232,61 @@ class ClawX:
         )
 
     def _run_scheduled(self, name, prompt):
-        """Execute a scheduled prompt by injecting into the PTY."""
-        self.logger.info(f"[Schedule] Running '{name}'")
-        if self.child_pid and self._is_alive():
-            self.inject(prompt)
-        else:
+        """Execute a scheduled prompt by injecting into the PTY.
+
+        When QUEUE_ENABLED, enqueue and let _queue_drain_loop pick it up
+        only when PTY is idle. Otherwise, inject directly (legacy behavior).
+        """
+        self.logger.info(f"[Schedule] Firing '{name}'")
+        if not (self.child_pid and self._is_alive()):
             self.logger.warning(f"[Schedule] Session not alive for '{name}'")
+            return
+        if not QUEUE_ENABLED:
+            self.inject(prompt)
+            return
+        with self._inject_queue_lock:
+            # Skip duplicates of same-name job (prevent stacking when Claude
+            # is busy and same cron fires twice). Bounded by QUEUE_MAX_DEPTH.
+            if any(item[1] == name for item in self._inject_queue):
+                self.logger.info(
+                    f"[Queue] '{name}' already queued — coalescing skip")
+                return
+            if len(self._inject_queue) >= QUEUE_MAX_DEPTH:
+                dropped = self._inject_queue.popleft()
+                self.logger.warning(
+                    f"[Queue] depth {QUEUE_MAX_DEPTH} exceeded, "
+                    f"dropping oldest '{dropped[1]}'")
+            self._inject_queue.append((time.monotonic(), name, prompt))
+            self.logger.info(
+                f"[Queue] enqueued '{name}', depth={len(self._inject_queue)}")
+
+    def _queue_drain_loop(self):
+        """Pop queued prompts only when PTY has been idle for
+        QUEUE_IDLE_SECONDS. The idle signal proxy is "no new output from
+        Claude in the last N seconds" — meaning Claude isn't streaming
+        a response or running a tool. Heuristic is conservative: false
+        idle (e.g. Claude paused mid-thought) just delivers the prompt
+        a bit early; false busy (rare) defers it to next cycle.
+        """
+        while not self.stop_event.is_set():
+            time.sleep(2.0)
+            if not QUEUE_ENABLED:
+                continue
+            with self._inject_queue_lock:
+                if not self._inject_queue:
+                    continue
+            idle_for = time.monotonic() - self._pty_last_output_at
+            if idle_for < QUEUE_IDLE_SECONDS:
+                continue
+            with self._inject_queue_lock:
+                if not self._inject_queue:
+                    continue
+                enqueued_at, name, prompt = self._inject_queue.popleft()
+            wait_s = time.monotonic() - enqueued_at
+            self.logger.info(
+                f"[Queue] popping '{name}' (waited {wait_s:.1f}s, "
+                f"idle {idle_for:.1f}s)")
+            self.inject(prompt)
 
     def _is_alive(self):
         """Check if the child process is still running."""
@@ -1602,6 +1672,16 @@ class ClawX:
         health_thread = Thread(target=self._health_loop, daemon=True)
         health_thread.start()
 
+        # Queued-inject drain (2026-05-14) — only runs when QUEUE_ENABLED,
+        # otherwise the loop just polls and sleeps. Starting unconditionally
+        # so toggling the env at runtime doesn't require a thread restart.
+        queue_thread = Thread(target=self._queue_drain_loop, daemon=True)
+        queue_thread.start()
+        if QUEUE_ENABLED:
+            self.logger.info(
+                f"[Queue] enabled, idle={QUEUE_IDLE_SECONDS}s, "
+                f"max_depth={QUEUE_MAX_DEPTH}")
+
         # Compact + rate-limit detection now runs inline in the main
         # PTY read loop via _maybe_handle_compact / _maybe_handle_rate_limit.
         # No background thread needed.
@@ -1649,6 +1729,9 @@ class ClawX:
                             os.write(stdout_fd, data)
                             transcript_f.write(data)
                             transcript_f.flush()
+                            # Queued-inject idle detector (2026-05-14):
+                            # any output = Claude is active, reset idle clock.
+                            self._pty_last_output_at = time.monotonic()
                             # PTY stream watchers — all detection runs here.
                             self._maybe_handle_startup_modal(data)
                             self._maybe_handle_compact(data)
