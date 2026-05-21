@@ -90,7 +90,7 @@ INJECT_GAP_SECONDS = float(os.environ.get("CLAWX_INJECT_GAP_SECONDS", "30"))
 # tool). Defaults: off (preserves current behavior); set
 # CLAWX_QUEUE_ENABLED=1 to opt in.
 QUEUE_ENABLED = os.environ.get("CLAWX_QUEUE_ENABLED", "1") == "1"
-QUEUE_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_IDLE_SECONDS", "5.0"))
+QUEUE_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_IDLE_SECONDS", "60.0"))  # 5→60s 2026-05-21. 5s falsely fires during silent long bash (cloudflared connect, yfinance fetch, Python imports). Each schedule fires every 15min+ → 60s idle delay is negligible cost vs cancelled morning-report bashes.
 QUEUE_MAX_DEPTH = int(os.environ.get("CLAWX_QUEUE_MAX_DEPTH", "10"))
 
 # Modal-prompt detection: strip ANSI escape sequences before pattern matching
