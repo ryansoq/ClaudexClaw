@@ -342,3 +342,67 @@ def test_inject_no_debounce_when_idle_long_enough(stub_clawx):
     # Only the inject's own paste-heuristic sleep (sub-second) — no debounce.
     debounce_sleeps = [s for s in sleeps if s >= 1.0]
     assert debounce_sleeps == [], f"unexpected debounce sleeps when idle: {debounce_sleeps}"
+
+
+# --- HYP #3 busy-marker queue gate (2026-05-22) -----------------------------
+
+def test_busy_marker_tracking_sets_timestamp(stub_clawx):
+    """_maybe_track_busy_marker bumps _pty_busy_at when Claude's
+    'esc to interrupt' marker appears (even buried in ANSI), and leaves it
+    untouched for ordinary output.
+    """
+    stub_clawx._pty_busy_at = 0.0
+    # ANSI-wrapped busy marker — the regex must see it after stripping.
+    stub_clawx._maybe_track_busy_marker(b"\x1b[2m\x1b[38;5;244m(esc to interrupt)\x1b[0m")
+    assert stub_clawx._pty_busy_at > 0.0
+
+    # Plain output without the marker must NOT bump it.
+    stub_clawx._pty_busy_at = 0.0
+    stub_clawx._maybe_track_busy_marker(b"some ordinary tool output line\n")
+    assert stub_clawx._pty_busy_at == 0.0
+
+
+def test_queue_gate_defers_during_silent_bash(stub_clawx):
+    """The bug this fixes: a quiet long bash produces no PTY output for a
+    few seconds, but Claude IS busy (spinner + 'esc to interrupt' animating).
+    The busy marker is fresh, so the gate must return None (do not inject)
+    even though output has been idle past the short ready-idle window.
+    """
+    now = 10_000.0
+    # No output for 5s (> QUEUE_READY_IDLE_SECONDS) ...
+    stub_clawx._pty_last_output_at = now - 5.0
+    # ... but busy marker seen 0.5s ago (spinner still animating).
+    stub_clawx._pty_busy_at = now - 0.5
+    assert stub_clawx._queue_inject_gate(now) is None
+
+
+def test_queue_gate_ready_after_busy_clears(stub_clawx):
+    """Once the busy marker has been gone QUEUE_BUSY_CLEAR_SECONDS and output
+    is also quiet QUEUE_READY_IDLE_SECONDS, the 'ready' gate opens.
+    """
+    now = 10_000.0
+    stub_clawx._pty_last_output_at = now - (clawx.QUEUE_READY_IDLE_SECONDS + 1)
+    stub_clawx._pty_busy_at = now - (clawx.QUEUE_BUSY_CLEAR_SECONDS + 1)
+    assert stub_clawx._queue_inject_gate(now) == "ready"
+
+
+def test_queue_gate_idle_fallback_when_busy_marker_stuck(stub_clawx):
+    """Fallback path: if the busy marker stays fresh (e.g. a hung spinner or
+    a UI quirk that keeps redrawing 'esc to interrupt') but there has been NO
+    output for the full 60s window, the idle-fallback still releases the
+    prompt so the queue can never wedge permanently.
+    """
+    now = 10_000.0
+    # Busy marker seen recently (busy-clear gate NOT satisfied) ...
+    stub_clawx._pty_busy_at = now - 1.0
+    # ... yet no actual output for > QUEUE_IDLE_SECONDS.
+    stub_clawx._pty_last_output_at = now - (clawx.QUEUE_IDLE_SECONDS + 1)
+    assert stub_clawx._queue_inject_gate(now) == "idle-fallback"
+
+
+def test_queue_gate_nothing_when_streaming(stub_clawx):
+    """Active streaming: fresh output AND fresh busy marker → no inject."""
+    now = 10_000.0
+    stub_clawx._pty_busy_at = now - 0.2
+    stub_clawx._pty_last_output_at = now - 0.2
+    assert stub_clawx._queue_inject_gate(now) is None

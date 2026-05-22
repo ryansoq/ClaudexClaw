@@ -92,6 +92,18 @@ INJECT_GAP_SECONDS = float(os.environ.get("CLAWX_INJECT_GAP_SECONDS", "30"))
 QUEUE_ENABLED = os.environ.get("CLAWX_QUEUE_ENABLED", "1") == "1"
 QUEUE_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_IDLE_SECONDS", "60.0"))  # 5→60s 2026-05-21. 5s falsely fires during silent long bash (cloudflared connect, yfinance fetch, Python imports). Each schedule fires every 15min+ → 60s idle delay is negligible cost vs cancelled morning-report bashes.
 QUEUE_MAX_DEPTH = int(os.environ.get("CLAWX_QUEUE_MAX_DEPTH", "10"))
+# HYP #3 (2026-05-22): how long the BUSY marker ("esc to interrupt") must be
+# absent before the queue may inject. Short, because the marker re-appears
+# every spinner frame (~sub-second) while Claude works; a few seconds of
+# absence reliably means the response/tool finished.
+QUEUE_BUSY_CLEAR_SECONDS = float(os.environ.get("CLAWX_QUEUE_BUSY_CLEAR_SECONDS", "4.0"))
+# Short idle gate paired with the busy-clear check (output also quiet).
+QUEUE_READY_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_READY_IDLE_SECONDS", "3.0"))
+# BUSY marker: Claude Code shows "esc to interrupt" (sometimes "to interrupt"
+# when wrapped) while streaming a response or running a tool. Matched on
+# ANSI-stripped output. This is the #3 "ready marker" signal, inverted:
+# present = busy, absent-for-a-while = ready.
+_BUSY_MARKER_RE = re.compile(rb"esc to interrupt|to interrupt\)")
 
 # Modal-prompt detection: strip ANSI escape sequences before pattern matching
 # so colored TUI output doesn't fool the detector.
@@ -561,6 +573,15 @@ class ClawX:
         self._inject_queue = deque()
         self._inject_queue_lock = Lock()
         self._pty_last_output_at = time.monotonic()
+        # HYP #3 ready-marker (2026-05-22): Claude Code prints "esc to
+        # interrupt" (+ animated spinner) continuously while it is streaming
+        # a response or running a tool. We track the last time that BUSY
+        # marker appeared; the drain loop refuses to inject until it has been
+        # gone for QUEUE_BUSY_CLEAR_SECONDS. This fixes the silent-bash false
+        # idle: during a quiet long bash the spinner still animates, so the
+        # busy marker stays fresh and we correctly defer injection. The 60s
+        # QUEUE_IDLE_SECONDS stays as an absolute fallback.
+        self._pty_busy_at = 0.0
 
     def build_command(self):
         """Build the claude CLI command."""
@@ -1260,13 +1281,35 @@ class ClawX:
             self.logger.info(
                 f"[Queue] enqueued '{name}', depth={len(self._inject_queue)}")
 
+    def _maybe_track_busy_marker(self, data: bytes):
+        """HYP #3: update _pty_busy_at when Claude's BUSY marker appears.
+
+        Claude Code prints "esc to interrupt" (with an animated spinner that
+        redraws every frame) the entire time it streams a response or runs a
+        tool — including silent long bash commands. So a fresh busy marker is
+        a reliable "Claude is working, do not inject" signal, and the silent
+        bash that fooled the pure-idle heuristic now keeps the marker fresh.
+        """
+        try:
+            clean = _ANSI_RE.sub(b"", data)
+            if _BUSY_MARKER_RE.search(clean):
+                self._pty_busy_at = time.monotonic()
+        except Exception:
+            pass
+
     def _queue_drain_loop(self):
-        """Pop queued prompts only when PTY has been idle for
-        QUEUE_IDLE_SECONDS. The idle signal proxy is "no new output from
-        Claude in the last N seconds" — meaning Claude isn't streaming
-        a response or running a tool. Heuristic is conservative: false
-        idle (e.g. Claude paused mid-thought) just delivers the prompt
-        a bit early; false busy (rare) defers it to next cycle.
+        """Pop queued prompts only when Claude looks idle-and-ready.
+
+        Two gates (HYP #3, 2026-05-22):
+          (a) READY: busy marker ("esc to interrupt") gone for
+              QUEUE_BUSY_CLEAR_SECONDS *and* no PTY output for
+              QUEUE_READY_IDLE_SECONDS — the precise "response finished"
+              signal that survives silent long bash.
+          (b) FALLBACK: PTY idle for the full QUEUE_IDLE_SECONDS (60s) — in
+              case the busy marker never appeared (e.g. a UI version change).
+
+        Either gate releases one queued prompt. The busy-marker gate is what
+        stops scheduled injects from cancelling an in-flight silent bash.
         """
         while not self.stop_event.is_set():
             time.sleep(2.0)
@@ -1275,9 +1318,12 @@ class ClawX:
             with self._inject_queue_lock:
                 if not self._inject_queue:
                     continue
-            idle_for = time.monotonic() - self._pty_last_output_at
-            if idle_for < QUEUE_IDLE_SECONDS:
+            now = time.monotonic()
+            gate = self._queue_inject_gate(now)
+            if gate is None:
                 continue
+            idle_for = now - self._pty_last_output_at
+            busy_clear_for = now - self._pty_busy_at
             with self._inject_queue_lock:
                 if not self._inject_queue:
                     continue
@@ -1285,8 +1331,28 @@ class ClawX:
             wait_s = time.monotonic() - enqueued_at
             self.logger.info(
                 f"[Queue] popping '{name}' (waited {wait_s:.1f}s, "
-                f"idle {idle_for:.1f}s)")
+                f"idle {idle_for:.1f}s, busy-clear {busy_clear_for:.1f}s, "
+                f"gate={gate})")
             self.inject(prompt)
+
+    def _queue_inject_gate(self, now):
+        """Return the gate name ('ready' / 'idle-fallback') if a queued
+        prompt may be injected at time `now`, else None. Pure decision
+        function (no I/O) so the busy-marker logic is unit-testable.
+
+        ready  : busy marker gone QUEUE_BUSY_CLEAR_SECONDS AND output quiet
+                 QUEUE_READY_IDLE_SECONDS — response/tool finished.
+        fallback: output quiet for the full QUEUE_IDLE_SECONDS regardless of
+                 busy marker (covers a UI change that drops the marker).
+        """
+        idle_for = now - self._pty_last_output_at
+        busy_clear_for = now - self._pty_busy_at
+        if (busy_clear_for >= QUEUE_BUSY_CLEAR_SECONDS
+                and idle_for >= QUEUE_READY_IDLE_SECONDS):
+            return "ready"
+        if idle_for >= QUEUE_IDLE_SECONDS:
+            return "idle-fallback"
+        return None
 
     def _is_alive(self):
         """Check if the child process is still running."""
@@ -1732,6 +1798,8 @@ class ClawX:
                             # Queued-inject idle detector (2026-05-14):
                             # any output = Claude is active, reset idle clock.
                             self._pty_last_output_at = time.monotonic()
+                            # HYP #3: track BUSY marker freshness for the queue.
+                            self._maybe_track_busy_marker(data)
                             # PTY stream watchers — all detection runs here.
                             self._maybe_handle_startup_modal(data)
                             self._maybe_handle_compact(data)
