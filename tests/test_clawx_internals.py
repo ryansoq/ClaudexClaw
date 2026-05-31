@@ -156,6 +156,69 @@ def test_watchdog_skips_when_no_frequent_jobs(stub_clawx):
     reload_mock.assert_not_called()
 
 
+def test_watchdog_survives_enabled_job_with_empty_cron(stub_clawx):
+    """Regression: an enabled schedule entry with an empty/missing cron must
+    not crash the watchdog. `"".split()[0]` raised IndexError, which—running
+    unguarded inside _health_loop—killed the whole health thread and silently
+    disabled crash recovery + SIGHUP reload for the rest of the session.
+    """
+    stub_clawx.config["schedule"] = {
+        "broken": {"enabled": True, "cron": "", "prompt": "x"},
+        "alsobroken": {"enabled": True, "prompt": "y"},  # cron key missing
+    }
+    stub_clawx.scheduler = MagicMock()
+    stub_clawx.last_job_event_at = datetime.now() - timedelta(minutes=5)
+    # Must not raise (previously IndexError on "".split()[0]).
+    stub_clawx._scheduler_watchdog()
+
+
+def test_is_alive_true_while_running(stub_clawx):
+    """waitpid returning (0, 0) means still running — not cached as exited."""
+    stub_clawx.child_pid = 4321
+    stub_clawx._child_exited = False
+    with patch.object(clawx.os, "waitpid", return_value=(0, 0)):
+        assert stub_clawx._is_alive() is True
+        assert stub_clawx._is_alive() is True
+
+
+def test_is_alive_memoizes_exit_single_reaper(stub_clawx):
+    """Single-reaper (option-A): once the child is reaped, _is_alive caches the
+    exit and never calls waitpid again. This is what stops the three threads
+    (main loop / health / scheduler) from double-reaping or waitpid-ing a
+    recycled PID.
+    """
+    stub_clawx.child_pid = 4321
+    stub_clawx._child_exited = False
+    calls = []
+
+    def fake_waitpid(pid, flags):
+        calls.append(pid)
+        return (pid, 0)  # reaped — child has exited
+
+    with patch.object(clawx.os, "waitpid", side_effect=fake_waitpid):
+        assert stub_clawx._is_alive() is False  # first call reaps
+        assert stub_clawx._is_alive() is False  # cached
+        assert stub_clawx._is_alive() is False  # cached
+    assert len(calls) == 1  # waitpid invoked exactly once
+
+
+def test_is_alive_memoizes_childprocesserror(stub_clawx):
+    """A ChildProcessError (already reaped elsewhere) is cached too, so we
+    never waitpid a PID that may have been recycled by the OS."""
+    stub_clawx.child_pid = 4321
+    stub_clawx._child_exited = False
+    calls = []
+
+    def fake_waitpid(pid, flags):
+        calls.append(pid)
+        raise ChildProcessError()
+
+    with patch.object(clawx.os, "waitpid", side_effect=fake_waitpid):
+        assert stub_clawx._is_alive() is False
+        assert stub_clawx._is_alive() is False
+    assert len(calls) == 1
+
+
 def test_reload_schedules_clears_then_reloads(stub_clawx):
     stub_clawx.scheduler = MagicMock()
     stub_clawx.scheduler.get_jobs.return_value = ["a", "b"]

@@ -529,6 +529,13 @@ class ClawX:
         self.child_pid = None
         self.stop_event = Event()
         self.write_lock = Lock()
+        # Single-owner child lifecycle (option-A refactor, 2026-05-30):
+        # _child_lock serializes the one waitpid reaper (_is_alive) against
+        # the fd/pid swap in _spawn_claude; _child_exited memoizes the reap so
+        # no thread double-reaps a recycled PID. Only the main run() loop
+        # respawns the child — _health_loop is watchdog-only.
+        self._child_lock = Lock()
+        self._child_exited = False
         # Separate lock so inject's debounce sleep doesn't block the
         # write_lock-protected Esc/keystroke paths used for modal dismissal.
         self._inject_gap_lock = Lock()
@@ -581,7 +588,10 @@ class ClawX:
         # idle: during a quiet long bash the spinner still animates, so the
         # busy marker stays fresh and we correctly defer injection. The 60s
         # QUEUE_IDLE_SECONDS stays as an absolute fallback.
-        self._pty_busy_at = 0.0
+        # Conservative default: treat as "recently busy" until the first
+        # idle is actually observed, so the queue gate can't inject during
+        # the very first in-flight response before any busy marker is seen.
+        self._pty_busy_at = time.monotonic()
 
     def build_command(self):
         """Build the claude CLI command."""
@@ -883,7 +893,8 @@ class ClawX:
         for sched in self.config.get("schedule", {}).values():
             if not sched.get("enabled"):
                 continue
-            cron_min = sched.get("cron", "").split()[0]
+            cron_parts = (sched.get("cron") or "").split()
+            cron_min = cron_parts[0] if cron_parts else ""
             if "/" in cron_min or "," in cron_min or "*" == cron_min:
                 has_frequent_job = True
                 break
@@ -1355,14 +1366,28 @@ class ClawX:
         return None
 
     def _is_alive(self):
-        """Check if the child process is still running."""
-        if self.child_pid is None:
-            return False
-        try:
-            pid, status = os.waitpid(self.child_pid, os.WNOHANG)
-            return pid == 0  # 0 means still running
-        except ChildProcessError:
-            return False
+        """Check if the child process is still running.
+
+        Single safe reaper: serialized by _child_lock and memoized via
+        _child_exited so concurrent callers (main loop / health loop /
+        scheduler) never double-reap and never waitpid a recycled PID. The
+        first caller to observe exit reaps the zombie; everyone else reads
+        the cached flag.
+        """
+        with self._child_lock:
+            if self.child_pid is None or self._child_exited:
+                return False
+            try:
+                pid, _status = os.waitpid(self.child_pid, os.WNOHANG)
+                if pid == 0:
+                    return True  # still running
+                self._child_exited = True  # reaped here
+                return False
+            except ChildProcessError:
+                self._child_exited = True
+                return False
+            except OSError:
+                return False
 
     # Sustained-uptime threshold for resetting restart_count. After the
     # child has been alive for this long since the most recent respawn,
@@ -1400,11 +1425,21 @@ class ClawX:
         max_restarts = session_cfg["max_restart_attempts"]
 
         while not self.stop_event.is_set():
-            time.sleep(interval)
+            # Sleep in short slices so a SIGHUP-deferred reload is applied
+            # within ~2s instead of waiting the full health interval. The
+            # health check itself still runs only once per `interval`.
+            waited = 0.0
+            while waited < interval and not self.stop_event.is_set():
+                if self._reload_requested:
+                    self._reload_requested = False
+                    self._reload_schedules()
+                slice_s = min(2.0, interval - waited)
+                time.sleep(slice_s)
+                waited += slice_s
             if self.stop_event.is_set():
                 break
 
-            # SIGHUP-deferred reload runs here, off the signal context.
+            # SIGHUP-deferred reload (final check after the wait window).
             if self._reload_requested:
                 self._reload_requested = False
                 self._reload_schedules()
@@ -1413,16 +1448,17 @@ class ClawX:
                 uptime = str(datetime.now() - self.started_at).split(".")[0] if self.started_at else "?"
                 self._maybe_reset_restart_count()
                 self.logger.info(f"Health OK | uptime={uptime} | restarts={self.restart_count}")
-                self._scheduler_watchdog()
-            elif session_cfg.get("auto_restart", True) and not self.stop_event.is_set():
-                if self.restart_count < max_restarts:
-                    self.logger.warning("Session died, auto-restarting...")
-                    delay = session_cfg.get("restart_delay_seconds", 5)
-                    time.sleep(delay)
-                    self._spawn_claude()
-                    self.restart_count += 1
-                else:
-                    self.logger.error(f"Max restarts ({max_restarts}) reached.")
+                try:
+                    self._scheduler_watchdog()
+                except Exception:
+                    self.logger.exception("[Watchdog] check failed (non-fatal)")
+            else:
+                # Child not alive. Respawn is owned by the main run() loop
+                # now (single-owner lifecycle) so the two threads can't race
+                # on waitpid / the fd swap. If the main loop has already
+                # exited (stop / restart), there is nothing to recover.
+                self.logger.info(
+                    "Health: child not alive — main loop owns recovery.")
 
     def _get_project_dir(self):
         """Resolve project_dir to absolute path."""
@@ -1432,6 +1468,20 @@ class ClawX:
         if not p.is_absolute():
             p = BASE_DIR / p
         return str(p.resolve())
+
+    def _reset_pty_detection_state(self):
+        """Clear per-spawn PTY detection buffers + idle/busy clocks so a
+        respawned child starts clean (no stale modal buffers, conservative
+        busy marker). Cooldown timers are intentionally left intact."""
+        self._startup_buffer = bytearray()
+        self._startup_modal_active = False
+        self._startup_modal_handled = False
+        self._ratelimit_buffer = bytearray()
+        self._resume_buffer = bytearray()
+        self._permission_buffer = bytearray()
+        self._compact_buffer = bytearray()
+        self._pty_last_output_at = time.monotonic()
+        self._pty_busy_at = time.monotonic()
 
     def _spawn_claude(self):
         """Fork + exec Claude in a PTY using pty.fork()."""
@@ -1452,10 +1502,28 @@ class ClawX:
             os._exit(1)
         else:
             # === Parent process ===
-            self.master_fd = master_fd
-            self.child_pid = child_pid
+            # Swap fd/pid under write_lock (vs inject writers) + _child_lock
+            # (vs the _is_alive reaper). Lock order write_lock -> _child_lock
+            # is the only order used anywhere, so no deadlock. Only the main
+            # run() loop calls this, so no thread is mid-select on old_fd.
+            with self.write_lock:
+                old_fd = self.master_fd
+                self.master_fd = master_fd
+                with self._child_lock:
+                    self.child_pid = child_pid
+                    self._child_exited = False
+            # Close the prior master AFTER the swap, else a respawn leaks one
+            # fd per restart. Safe to close here: this runs on the main thread
+            # which is not selecting on old_fd at this point.
+            if old_fd is not None:
+                try:
+                    os.close(old_fd)
+                except OSError:
+                    pass
             self.started_at = datetime.now()
             self.last_restart_at = self.started_at
+            # Per-spawn detection state must start clean on a respawn.
+            self._reset_pty_detection_state()
 
             # Reset startup-modal detection state. We re-arm on every spawn
             # because --continue can land us in a different conversation each
@@ -1764,12 +1832,36 @@ class ClawX:
         try:
             stdin_fd = sys.stdin.fileno()
             stdout_fd = sys.stdout.fileno()
+            session_cfg = self.config["session"]
+            max_restarts = session_cfg["max_restart_attempts"]
 
-            while not self.stop_event.is_set() and self._is_alive():
+            while not self.stop_event.is_set():
+                # Single owner of child lifecycle: detect death HERE and
+                # recover in-loop instead of exiting. The old code let a
+                # child crash fall out of the loop and end ClawX entirely
+                # (auto_restart was effectively dead) — this is the fix.
+                if not self._is_alive():
+                    if self.restart_requested:
+                        break  # explicit self-restart → re-exec via main()
+                    if (session_cfg.get("auto_restart", True)
+                            and self.restart_count < max_restarts):
+                        self.logger.warning(
+                            "Child died — main loop respawning "
+                            f"(restart {self.restart_count + 1}/{max_restarts})")
+                        time.sleep(session_cfg.get("restart_delay_seconds", 5))
+                        self._spawn_claude()
+                        self.restart_count += 1
+                        continue
+                    self.logger.error(
+                        "Child died and not restarting "
+                        "(auto_restart off or max restarts reached).")
+                    break
+
                 try:
                     rlist, _, _ = select.select([stdin_fd, self.master_fd], [], [], 1.0)
                 except (ValueError, OSError):
-                    break
+                    # master_fd may be stale mid-respawn — re-evaluate at top.
+                    continue
 
                 for fd in rlist:
                     if fd == stdin_fd:
@@ -1789,15 +1881,24 @@ class ClawX:
                         # Claude output → forward to terminal + transcript
                         try:
                             data = os.read(self.master_fd, 4096)
-                            if not data:
-                                self.stop_event.set()
-                                break
+                        except OSError:
+                            data = b""
+                        if not data:
+                            # Child EOF/closed → it exited. Do NOT stop; let
+                            # the top-of-loop liveness check respawn it.
+                            break
+                        try:
                             os.write(stdout_fd, data)
                             transcript_f.write(data)
                             transcript_f.flush()
-                            # Queued-inject idle detector (2026-05-14):
-                            # any output = Claude is active, reset idle clock.
-                            self._pty_last_output_at = time.monotonic()
+                        except OSError:
+                            # Our own terminal/transcript died — real stop.
+                            self.stop_event.set()
+                            break
+                        # Queued-inject idle detector (2026-05-14):
+                        # any output = Claude is active, reset idle clock.
+                        self._pty_last_output_at = time.monotonic()
+                        try:
                             # HYP #3: track BUSY marker freshness for the queue.
                             self._maybe_track_busy_marker(data)
                             # PTY stream watchers — all detection runs here.
@@ -1808,7 +1909,8 @@ class ClawX:
                             self._maybe_handle_resume_modal(data)
                             self._maybe_handle_permission_prompt(data)
                         except OSError:
-                            self.stop_event.set()
+                            # A modal-dismissal write hit a dead child — let
+                            # the top-of-loop liveness check handle respawn.
                             break
 
         finally:
