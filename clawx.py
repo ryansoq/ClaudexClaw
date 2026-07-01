@@ -97,8 +97,16 @@ QUEUE_MAX_DEPTH = int(os.environ.get("CLAWX_QUEUE_MAX_DEPTH", "10"))
 # every spinner frame (~sub-second) while Claude works; a few seconds of
 # absence reliably means the response/tool finished.
 QUEUE_BUSY_CLEAR_SECONDS = float(os.environ.get("CLAWX_QUEUE_BUSY_CLEAR_SECONDS", "4.0"))
-# Short idle gate paired with the busy-clear check (output also quiet).
-QUEUE_READY_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_READY_IDLE_SECONDS", "3.0"))
+# Idle gate paired with the busy-clear check (output also quiet).
+# Raised 3→45s (2026-07-01): the 3s gate falsely fired during multi-step tasks
+# like the morning report, which runs steps as BACKGROUND bashes. While waiting
+# for a background result the PTY is fully silent (no output, no spinner), so
+# after 3s idle + 4s busy-clear the queue judged the turn "finished" and popped
+# the next scheduled prompt — interrupting the half-sent report. 45s comfortably
+# exceeds the gaps between morning-report steps; cost is negligible since each
+# schedule fires every 15min+. (Root fix would be a multi-step task lock — see
+# backlog; this threshold bump is the cheap 1-line mitigation Ryan approved.)
+QUEUE_READY_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_READY_IDLE_SECONDS", "45.0"))
 # BUSY marker: Claude Code shows "esc to interrupt" (sometimes "to interrupt"
 # when wrapped) while streaming a response or running a tool. Matched on
 # ANSI-stripped output. This is the #3 "ready marker" signal, inverted:
