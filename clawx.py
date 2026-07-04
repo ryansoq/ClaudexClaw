@@ -544,6 +544,12 @@ class ClawX:
         # respawns the child — _health_loop is watchdog-only.
         self._child_lock = Lock()
         self._child_exited = False
+        # Raw waitpid status of the last reaped child, or None if unknown
+        # (e.g. reaped elsewhere via ChildProcessError). Lets run() tell a
+        # deliberate user quit (clean exit 0 — follow the user out) from a
+        # crash (respawn). 2026-07-04: auto-restart fought the user's
+        # Ctrl+C model-switch quits, burning max_restarts in 15s.
+        self._child_exit_status = None
         # Separate lock so inject's debounce sleep doesn't block the
         # write_lock-protected Esc/keystroke paths used for modal dismissal.
         self._inject_gap_lock = Lock()
@@ -1278,12 +1284,20 @@ class ClawX:
         only when PTY is idle. Otherwise, inject directly (legacy behavior).
         """
         self.logger.info(f"[Schedule] Firing '{name}'")
-        if not (self.child_pid and self._is_alive()):
-            self.logger.warning(f"[Schedule] Session not alive for '{name}'")
-            return
         if not QUEUE_ENABLED:
+            if not (self.child_pid and self._is_alive()):
+                self.logger.warning(f"[Schedule] Session not alive for '{name}'")
+                return
             self.inject(prompt)
             return
+        # Queue mode: enqueue even while the child is dead/respawning — the
+        # drain loop defers until the child is alive and idle, so a cron that
+        # fires inside a crash window (e.g. the 8:20 morning report) is
+        # delivered after recovery instead of dropped for the day.
+        if not (self.child_pid and self._is_alive()):
+            self.logger.warning(
+                f"[Schedule] Session not alive — queueing '{name}' "
+                "for delivery after respawn")
         with self._inject_queue_lock:
             # Skip duplicates of same-name job (prevent stacking when Claude
             # is busy and same cron fires twice). Bounded by QUEUE_MAX_DEPTH.
@@ -1337,6 +1351,12 @@ class ClawX:
             with self._inject_queue_lock:
                 if not self._inject_queue:
                     continue
+            # Child dead / mid-respawn → hold queued prompts. Injecting now
+            # would write to a dead PTY and lose the prompt; after respawn,
+            # _reset_pty_detection_state gives the fresh child a full idle
+            # window before anything queued is delivered.
+            if not self._is_alive():
+                continue
             now = time.monotonic()
             gate = self._queue_inject_gate(now)
             if gate is None:
@@ -1386,16 +1406,41 @@ class ClawX:
             if self.child_pid is None or self._child_exited:
                 return False
             try:
-                pid, _status = os.waitpid(self.child_pid, os.WNOHANG)
+                pid, status = os.waitpid(self.child_pid, os.WNOHANG)
                 if pid == 0:
                     return True  # still running
                 self._child_exited = True  # reaped here
+                self._child_exit_status = status
                 return False
             except ChildProcessError:
                 self._child_exited = True
+                self._child_exit_status = None  # reaped elsewhere; unknown
                 return False
             except OSError:
                 return False
+
+    @staticmethod
+    def _is_clean_exit(status):
+        """True if a waitpid status means the child exited voluntarily with
+        code 0 — i.e. the user quit Claude on purpose (Ctrl+C ×2, /exit).
+        Signals and non-zero codes are crashes. None (status unknown) is
+        treated as a crash so recovery stays the default."""
+        return (status is not None
+                and os.WIFEXITED(status)
+                and os.WEXITSTATUS(status) == 0)
+
+    # Backoff between respawn attempts: base × 6^n, capped. With the default
+    # 5s base this gives 5s → 30s → 120s, so three attempts span ~2.5 min
+    # instead of 15s — enough to ride out transient boot-time failures
+    # (network not up yet) that a fixed 5s delay burned all attempts on.
+    RESTART_BACKOFF_FACTOR = 6
+    RESTART_BACKOFF_CAP_SECONDS = 120.0
+
+    @classmethod
+    def _restart_backoff(cls, restart_count, base_delay):
+        """Seconds to wait before respawn attempt #(restart_count+1)."""
+        return min(base_delay * (cls.RESTART_BACKOFF_FACTOR ** restart_count),
+                   cls.RESTART_BACKOFF_CAP_SECONDS)
 
     # Sustained-uptime threshold for resetting restart_count. After the
     # child has been alive for this long since the most recent respawn,
@@ -1468,6 +1513,36 @@ class ClawX:
                 self.logger.info(
                     "Health: child not alive — main loop owns recovery.")
 
+    # Transcripts (raw PTY dumps) are the main log-dir growth driver — the
+    # clawx-*.log files rotate via RotatingFileHandler but transcripts never
+    # did (100M+ observed 2026-07-04). Default keeps two weeks; set
+    # config logging.transcript_keep_days to adjust, or 0 to disable pruning.
+    TRANSCRIPT_KEEP_DAYS_DEFAULT = 14
+
+    def _prune_old_transcripts(self):
+        """Best-effort deletion of transcript-*.log older than the keep
+        window. Called once per run() startup; never raises."""
+        keep_days = (self.config.get("logging") or {}).get(
+            "transcript_keep_days", self.TRANSCRIPT_KEEP_DAYS_DEFAULT)
+        if not keep_days or keep_days <= 0:
+            return
+        cutoff = time.time() - keep_days * 86400
+        removed = 0
+        try:
+            for p in LOG_DIR.glob("transcript-*.log"):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                        removed += 1
+                except OSError:
+                    continue
+        except OSError:
+            return
+        if removed:
+            self.logger.info(
+                f"[Prune] removed {removed} transcript(s) "
+                f"older than {keep_days}d")
+
     def _get_project_dir(self):
         """Resolve project_dir to absolute path."""
         raw = self.config["claude"]["project_dir"]
@@ -1520,6 +1595,7 @@ class ClawX:
                 with self._child_lock:
                     self.child_pid = child_pid
                     self._child_exited = False
+                    self._child_exit_status = None
             # Close the prior master AFTER the swap, else a respawn leaks one
             # fd per restart. Safe to close here: this runs on the main thread
             # which is not selecting on old_fd at this point.
@@ -1833,7 +1909,8 @@ class ClawX:
             import tty
             tty.setraw(sys.stdin.fileno())
 
-        # Transcript log
+        # Transcript log (prune old ones first so the dir doesn't grow forever)
+        self._prune_old_transcripts()
         transcript = LOG_DIR / f"transcript-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
         transcript_f = open(transcript, "wb")
 
@@ -1851,18 +1928,39 @@ class ClawX:
                 if not self._is_alive():
                     if self.restart_requested:
                         break  # explicit self-restart → re-exec via main()
+                    if self._is_clean_exit(self._child_exit_status):
+                        # Deliberate quit (exit 0) — follow the user out
+                        # instead of fighting them with respawns (2026-07-04:
+                        # Ctrl+C quits during a model switch burned all
+                        # max_restarts in 15s before letting the user go).
+                        self.logger.info(
+                            "Child exited cleanly (user quit) — "
+                            "ClawX following, no respawn.")
+                        self._send_telegram(
+                            "👋 Claude 正常退出（使用者操作），ClawX 跟著關閉"
+                            "，不自動重啟。", tag="CleanExit")
+                        break
                     if (session_cfg.get("auto_restart", True)
                             and self.restart_count < max_restarts):
+                        delay = self._restart_backoff(
+                            self.restart_count,
+                            session_cfg.get("restart_delay_seconds", 5))
                         self.logger.warning(
-                            "Child died — main loop respawning "
+                            "Child died — main loop respawning in "
+                            f"{delay:.0f}s "
                             f"(restart {self.restart_count + 1}/{max_restarts})")
-                        time.sleep(session_cfg.get("restart_delay_seconds", 5))
+                        time.sleep(delay)
                         self._spawn_claude()
                         self.restart_count += 1
                         continue
                     self.logger.error(
                         "Child died and not restarting "
                         "(auto_restart off or max restarts reached).")
+                    # Loud last words — without this, exhausting max_restarts
+                    # while the user is away means Nami dies silently.
+                    self._send_telegram(
+                        "💀 ClawX 放棄自動重啟（連續 crash 達上限），已停止。"
+                        "需要手動重新啟動：python3 clawx.py", tag="FatalExit")
                     break
 
                 try:
@@ -1962,6 +2060,28 @@ class ClawX:
             print("\n[ClawX] Session ended.")
 
         return RESTART_EXIT_CODE if self.restart_requested else 0
+
+
+def _other_clawx_pid(pid_file=PID_FILE, proc_root="/proc"):
+    """Return the PID of another live ClawX instance, or None.
+
+    Guards against double-starting ClawX — two instances polling the same
+    Telegram bot token produce endless 409 Conflicts (the recurring failure
+    mode in HEARTBEAT.md's troubleshooting table). A stale pid file (dead
+    PID, recycled PID running something else, or our own PID during the
+    SIGUSR1 re-exec path) does not count.
+    """
+    try:
+        pid = int(Path(pid_file).read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if pid == os.getpid():
+        return None  # our own re-exec
+    try:
+        cmdline = (Path(proc_root) / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None  # PID dead → stale file
+    return pid if b"clawx.py" in cmdline else None
 
 
 def _resolve_command(raw_cmd):
@@ -2088,6 +2208,15 @@ def main():
 
     if len(sys.argv) < 2:
         # Default: run PTY passthrough with restart loop
+        other = _other_clawx_pid()
+        if other:
+            print(
+                f"Error: another ClawX is already running (PID {other}).\n"
+                f"Two instances polling the same Telegram token cause 409 "
+                f"Conflicts.\nStop it first:  python3 clawx.py stop",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         PID_FILE.write_text(str(os.getpid()))
         try:
             clawx = ClawX()

@@ -469,3 +469,144 @@ def test_queue_gate_nothing_when_streaming(stub_clawx):
     stub_clawx._pty_busy_at = now - 0.2
     stub_clawx._pty_last_output_at = now - 0.2
     assert stub_clawx._queue_inject_gate(now) is None
+
+
+# ── 2026-07-04 review fixes: clean-exit, backoff, queue-while-dead, ──
+# ── double-start guard, transcript prune                            ──
+
+def test_is_clean_exit_zero_status():
+    """waitpid status 0 == WIFEXITED + code 0 → deliberate user quit."""
+    assert ClawX._is_clean_exit(0) is True
+
+
+def test_is_clean_exit_nonzero_and_signal_are_crashes():
+    # exit(1) → status 1<<8; SIGKILL → status 9 (signal bits, WIFEXITED False)
+    assert ClawX._is_clean_exit(1 << 8) is False
+    assert ClawX._is_clean_exit(9) is False
+
+
+def test_is_clean_exit_unknown_status_is_crash():
+    """None (reaped elsewhere, status lost) must default to crash so the
+    respawn path stays the fallback."""
+    assert ClawX._is_clean_exit(None) is False
+
+
+def test_is_alive_records_exit_status(stub_clawx):
+    """The reaper must capture waitpid's status so run() can distinguish a
+    user quit from a crash (2026-07-04: status was discarded, auto-restart
+    fought the user's Ctrl+C quits)."""
+    stub_clawx.child_pid = 4321
+    stub_clawx._child_exited = False
+    with patch.object(clawx.os, "waitpid", return_value=(4321, 0)):
+        assert stub_clawx._is_alive() is False
+    assert stub_clawx._child_exit_status == 0
+    assert ClawX._is_clean_exit(stub_clawx._child_exit_status) is True
+
+
+def test_is_alive_childprocesserror_clears_status(stub_clawx):
+    stub_clawx.child_pid = 4321
+    stub_clawx._child_exited = False
+    stub_clawx._child_exit_status = 0  # stale from a previous child
+    with patch.object(clawx.os, "waitpid", side_effect=ChildProcessError()):
+        assert stub_clawx._is_alive() is False
+    assert stub_clawx._child_exit_status is None
+
+
+def test_restart_backoff_escalates_and_caps():
+    """5s base → 5, 30, 120 (capped): three attempts span ~2.5min instead of
+    the 15s that burned all attempts during transient boot failures."""
+    assert ClawX._restart_backoff(0, 5) == 5
+    assert ClawX._restart_backoff(1, 5) == 30
+    assert ClawX._restart_backoff(2, 5) == 120  # 180 capped
+    assert ClawX._restart_backoff(5, 5) == 120
+
+
+def test_run_scheduled_queues_when_child_dead(stub_clawx):
+    """Queue mode: a cron firing inside a crash window must be queued for
+    post-respawn delivery, not dropped (a dropped 8:20 morning report is
+    lost for the whole day)."""
+    stub_clawx.child_pid = None  # dead
+    with patch.object(clawx, "QUEUE_ENABLED", True):
+        stub_clawx._run_scheduled("morning-report", "run it")
+    assert len(stub_clawx._inject_queue) == 1
+    assert stub_clawx._inject_queue[0][1] == "morning-report"
+
+
+def test_run_scheduled_direct_mode_still_drops_when_dead(stub_clawx):
+    """Legacy non-queue mode keeps the old drop-with-warning behavior."""
+    stub_clawx.child_pid = None
+    stub_clawx.inject = MagicMock()
+    with patch.object(clawx, "QUEUE_ENABLED", False):
+        stub_clawx._run_scheduled("hb", "ping")
+    stub_clawx.inject.assert_not_called()
+    assert len(stub_clawx._inject_queue) == 0
+
+
+def test_other_clawx_pid_detects_live_instance(tmp_path):
+    pid_file = tmp_path / "mono.pid"
+    pid_file.write_text("54321")
+    proc = tmp_path / "proc" / "54321"
+    proc.mkdir(parents=True)
+    (proc / "cmdline").write_bytes(b"python3\x00clawx.py\x00")
+    assert clawx._other_clawx_pid(pid_file, tmp_path / "proc") == 54321
+
+
+def test_other_clawx_pid_ignores_stale_and_foreign(tmp_path):
+    pid_file = tmp_path / "mono.pid"
+    proc_root = tmp_path / "proc"
+    # No pid file at all
+    assert clawx._other_clawx_pid(pid_file, proc_root) is None
+    # Dead PID (no /proc entry)
+    pid_file.write_text("54321")
+    assert clawx._other_clawx_pid(pid_file, proc_root) is None
+    # PID recycled by an unrelated process
+    proc = proc_root / "54321"
+    proc.mkdir(parents=True)
+    (proc / "cmdline").write_bytes(b"nginx\x00-g\x00daemon off;\x00")
+    assert clawx._other_clawx_pid(pid_file, proc_root) is None
+    # Garbage pid file
+    pid_file.write_text("not-a-pid")
+    assert clawx._other_clawx_pid(pid_file, proc_root) is None
+
+
+def test_other_clawx_pid_ignores_own_pid(tmp_path):
+    """The SIGUSR1 re-exec path re-runs main() under the SAME pid — the
+    guard must not lock ClawX out of its own restart."""
+    import os as real_os
+    pid_file = tmp_path / "mono.pid"
+    pid_file.write_text(str(real_os.getpid()))
+    assert clawx._other_clawx_pid(pid_file, "/proc") is None
+
+
+def test_prune_old_transcripts(stub_clawx, tmp_path, monkeypatch):
+    import os as real_os
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(clawx, "LOG_DIR", log_dir)
+    old = log_dir / "transcript-20260101-000000.log"
+    new = log_dir / "transcript-20260704-120000.log"
+    other = log_dir / "clawx-20260101.log"  # rotated separately — untouched
+    for f in (old, new, other):
+        f.write_text("x")
+    stale = clawx.time.time() - 30 * 86400
+    real_os.utime(old, (stale, stale))
+    real_os.utime(other, (stale, stale))
+    stub_clawx.config["logging"] = {"transcript_keep_days": 14}
+    stub_clawx._prune_old_transcripts()
+    assert not old.exists()          # stale transcript pruned
+    assert new.exists()              # fresh transcript kept
+    assert other.exists()            # non-transcript logs never touched
+
+
+def test_prune_disabled_with_zero_keep_days(stub_clawx, tmp_path, monkeypatch):
+    import os as real_os
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(clawx, "LOG_DIR", log_dir)
+    old = log_dir / "transcript-20250101-000000.log"
+    old.write_text("x")
+    stale = clawx.time.time() - 365 * 86400
+    real_os.utime(old, (stale, stale))
+    stub_clawx.config["logging"] = {"transcript_keep_days": 0}
+    stub_clawx._prune_old_transcripts()
+    assert old.exists()
