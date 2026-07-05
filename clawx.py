@@ -107,11 +107,33 @@ QUEUE_BUSY_CLEAR_SECONDS = float(os.environ.get("CLAWX_QUEUE_BUSY_CLEAR_SECONDS"
 # schedule fires every 15min+. (Root fix would be a multi-step task lock — see
 # backlog; this threshold bump is the cheap 1-line mitigation Ryan approved.)
 QUEUE_READY_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_READY_IDLE_SECONDS", "45.0"))
-# BUSY marker: Claude Code shows "esc to interrupt" (sometimes "to interrupt"
-# when wrapped) while streaming a response or running a tool. Matched on
-# ANSI-stripped output. This is the #3 "ready marker" signal, inverted:
-# present = busy, absent-for-a-while = ready.
-_BUSY_MARKER_RE = re.compile(rb"esc to interrupt|to interrupt\)")
+# BUSY marker: Claude Code shows "esc to interrupt" while streaming a
+# response or running a tool. Matched on ANSI-stripped, WHITESPACE-SQUASHED
+# output: newer CLI versions (observed v2.1.201, 2026-07-05) render the
+# status line with cursor-forward moves instead of literal spaces, so after
+# ANSI stripping the marker reads "esctointerrupt" — the old spaced regex
+# never matched and _pty_busy_at stayed frozen at spawn time (busy-clear
+# 26000-52000s in logs), leaving the 45s idle timer as the only gate and
+# letting queued prompts interrupt long silent tool calls. Squashing all
+# whitespace before matching covers both old and new renderings.
+_BUSY_MARKER_RE = re.compile(rb"esctointerrupt|tointerrupt\)")
+_WS_RE = re.compile(rb"\s+")
+# Rolling-buffer cap for busy-marker tracking (marker may split across
+# 4096-byte PTY read chunks).
+_BUSY_TRACK_BUFFER_LIMIT = 4096
+
+# Ground-truth turn gate (2026-07-05): before injecting a queued prompt,
+# check the active session jsonl — Claude CLI appends an assistant entry
+# with a tool_use block when a tool starts and a user/tool_result entry
+# when it finishes, so "last real entry is a plain-text assistant message"
+# is a reliable "turn finished" signal that survives silent bashes and UI
+# redesigns. Set CLAWX_QUEUE_TURN_GATE=0 to fall back to time gates only.
+QUEUE_TURN_GATE_ENABLED = os.environ.get("CLAWX_QUEUE_TURN_GATE", "1") == "1"
+# Anti-wedge: if the jsonl gate keeps saying "busy" (format change, stuck
+# tool) but the oldest queued prompt has waited this long AND the time
+# gates pass, inject anyway and log loudly.
+QUEUE_WEDGE_OVERRIDE_SECONDS = float(
+    os.environ.get("CLAWX_QUEUE_WEDGE_OVERRIDE_SECONDS", "900"))
 
 # Modal-prompt detection: strip ANSI escape sequences before pattern matching
 # so colored TUI output doesn't fool the detector.
@@ -190,18 +212,30 @@ def detect_startup_modal(buf: bytes):
     return max(numbers)
 
 
-def _find_active_session_jsonl():
+def _find_active_session_jsonl(prefer_project_dir=None):
     """Return the most recently modified Claude session jsonl, or None.
 
     Claude CLI writes one jsonl per session under
-    ``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl``. ClawX
-    runs a single interactive session at a time, so the most-recently
-    modified file across all project dirs is the active session.
+    ``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl``.
+
+    When ``prefer_project_dir`` is given (the queue's turn gate passes
+    ClawX's own project dir), only that project's subdir is searched —
+    otherwise a concurrent ``claude`` session in another directory
+    (e.g. the user's own terminal work) with a fresher mtime would be
+    mistaken for ours. Falls back to the global most-recent file when
+    the preferred subdir has no sessions.
     """
     proj_root = Path.home() / ".claude" / "projects"
     if not proj_root.exists():
         return None
-    candidates = list(proj_root.rglob("*.jsonl"))
+    candidates = []
+    if prefer_project_dir:
+        encoded = re.sub(r"[^A-Za-z0-9]", "-", str(prefer_project_dir))
+        subdir = proj_root / encoded
+        if subdir.exists():
+            candidates = list(subdir.glob("*.jsonl"))
+    if not candidates:
+        candidates = list(proj_root.rglob("*.jsonl"))
     if not candidates:
         return None
     try:
@@ -606,6 +640,8 @@ class ClawX:
         # idle is actually observed, so the queue gate can't inject during
         # the very first in-flight response before any busy marker is seen.
         self._pty_busy_at = time.monotonic()
+        # Rolling buffer for busy-marker tracking (see _maybe_track_busy_marker).
+        self._busy_track_buffer = bytearray()
 
     def build_command(self):
         """Build the claude CLI command."""
@@ -1324,9 +1360,20 @@ class ClawX:
         bash that fooled the pure-idle heuristic now keeps the marker fresh.
         """
         try:
-            clean = _ANSI_RE.sub(b"", data)
-            if _BUSY_MARKER_RE.search(clean):
+            # Rolling buffer: the marker can split across 4096-byte reads.
+            self._busy_track_buffer.extend(data)
+            if len(self._busy_track_buffer) > _BUSY_TRACK_BUFFER_LIMIT:
+                del self._busy_track_buffer[:-_BUSY_TRACK_BUFFER_LIMIT]
+            clean = _ANSI_RE.sub(b"", bytes(self._busy_track_buffer))
+            # Squash ALL whitespace: v2.1.x renders the status line with
+            # cursor moves, so the stripped text has no spaces between
+            # words ("esctointerrupt"); squashing also still matches the
+            # old spaced rendering.
+            if _BUSY_MARKER_RE.search(_WS_RE.sub(b"", clean)):
                 self._pty_busy_at = time.monotonic()
+                # Clear so one old marker can't keep re-matching forever
+                # and pin us "busy" after the turn actually ends.
+                self._busy_track_buffer = bytearray()
         except Exception:
             pass
 
@@ -1358,9 +1405,25 @@ class ClawX:
             if not self._is_alive():
                 continue
             now = time.monotonic()
-            gate = self._queue_inject_gate(now)
+            tc = self._jsonl_turn_complete() if QUEUE_TURN_GATE_ENABLED else None
+            gate = self._queue_inject_gate(now, tc)
             if gate is None:
-                continue
+                # Anti-wedge: jsonl gate saying "busy" forever (stuck tool,
+                # format change) must not starve the queue. If the oldest
+                # item has waited past the override window AND the pure
+                # time gates would allow it, inject anyway — loudly.
+                with self._inject_queue_lock:
+                    oldest = (self._inject_queue[0][0]
+                              if self._inject_queue else None)
+                if (tc is False and oldest is not None
+                        and now - oldest > QUEUE_WEDGE_OVERRIDE_SECONDS
+                        and self._queue_inject_gate(now, None) is not None):
+                    self.logger.warning(
+                        "[Queue] wedge override — jsonl gate stuck busy "
+                        f"{QUEUE_WEDGE_OVERRIDE_SECONDS:.0f}s+, forcing pop")
+                    gate = "wedge-override"
+                else:
+                    continue
             idle_for = now - self._pty_last_output_at
             busy_clear_for = now - self._pty_busy_at
             with self._inject_queue_lock:
@@ -1374,16 +1437,24 @@ class ClawX:
                 f"gate={gate})")
             self.inject(prompt)
 
-    def _queue_inject_gate(self, now):
+    def _queue_inject_gate(self, now, turn_complete=None):
         """Return the gate name ('ready' / 'idle-fallback') if a queued
         prompt may be injected at time `now`, else None. Pure decision
         function (no I/O) so the busy-marker logic is unit-testable.
+
+        turn_complete is the jsonl ground truth from _jsonl_turn_complete():
+        False = a turn is provably in flight (pending tool_use / fresh user
+        message) → NEVER inject, regardless of how quiet the PTY is. This is
+        what stops queued prompts from cancelling long silent bashes. True /
+        None (unknown) fall through to the time gates.
 
         ready  : busy marker gone QUEUE_BUSY_CLEAR_SECONDS AND output quiet
                  QUEUE_READY_IDLE_SECONDS — response/tool finished.
         fallback: output quiet for the full QUEUE_IDLE_SECONDS regardless of
                  busy marker (covers a UI change that drops the marker).
         """
+        if turn_complete is False:
+            return None
         idle_for = now - self._pty_last_output_at
         busy_clear_for = now - self._pty_busy_at
         if (busy_clear_for >= QUEUE_BUSY_CLEAR_SECONDS
@@ -1391,6 +1462,52 @@ class ClawX:
             return "ready"
         if idle_for >= QUEUE_IDLE_SECONDS:
             return "idle-fallback"
+        return None
+
+    def _jsonl_turn_complete(self, jsonl_path=None):
+        """Ground truth from the session jsonl: has the current turn ended?
+
+        Walks the jsonl tail backwards to the last real user/assistant
+        entry (skipping meta rows like queue-operation / last-prompt):
+
+          assistant, plain text/thinking → True  (turn finished)
+          assistant containing tool_use  → False (tool in flight — the
+                                                  silent-bash case)
+          user (new prompt / tool_result)→ False (Claude is about to
+                                                  respond or continue)
+          nothing parseable / no file    → None  (unknown — caller falls
+                                                  back to time gates)
+        """
+        if jsonl_path is None:
+            jsonl_path = _find_active_session_jsonl(
+                prefer_project_dir=self._get_project_dir())
+        if jsonl_path is None:
+            return None
+        try:
+            with open(jsonl_path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                chunk = min(size, 64 * 1024)
+                f.seek(size - chunk)
+                tail = f.read()
+        except OSError:
+            return None
+        for raw in reversed(tail.splitlines()):
+            try:
+                entry = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            etype = entry.get("type")
+            if etype not in ("user", "assistant"):
+                continue
+            if etype == "user":
+                return False
+            content = (entry.get("message") or {}).get("content")
+            if isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_use"
+                    for b in content):
+                return False
+            return True
         return None
 
     def _is_alive(self):
@@ -1565,6 +1682,7 @@ class ClawX:
         self._compact_buffer = bytearray()
         self._pty_last_output_at = time.monotonic()
         self._pty_busy_at = time.monotonic()
+        self._busy_track_buffer = bytearray()
 
     def _spawn_claude(self):
         """Fork + exec Claude in a PTY using pty.fork()."""

@@ -610,3 +610,125 @@ def test_prune_disabled_with_zero_keep_days(stub_clawx, tmp_path, monkeypatch):
     stub_clawx.config["logging"] = {"transcript_keep_days": 0}
     stub_clawx._prune_old_transcripts()
     assert old.exists()
+
+
+# ── 2026-07-05: busy-marker UI-change fix + jsonl turn gate ──
+# (queued prompts were interrupting in-flight turns: the v2.1.x status
+#  line renders with cursor moves, not spaces — "esctointerrupt" after
+#  ANSI strip — so the spaced regex never matched all session.)
+
+def test_busy_marker_matches_new_cursor_move_rendering(stub_clawx):
+    """v2.1.x: words separated by cursor-forward ANSI, not spaces."""
+    stub_clawx._pty_busy_at = 0.0
+    chunk = b"(shift+tab \x1b[1mto\x1b[0m cycle) \xc2\xb7 esc\x1b[1Cto\x1b[1Cinterrupt \xc2\xb7 \xe2\x86\x90 for agents"
+    stub_clawx._maybe_track_busy_marker(chunk)
+    assert stub_clawx._pty_busy_at > 0.0
+
+
+def test_busy_marker_still_matches_old_spaced_rendering(stub_clawx):
+    stub_clawx._pty_busy_at = 0.0
+    stub_clawx._maybe_track_busy_marker(b"spinner... esc to interrupt)")
+    assert stub_clawx._pty_busy_at > 0.0
+
+
+def test_busy_marker_survives_chunk_split(stub_clawx):
+    """The marker arriving across two 4096-byte PTY reads must still match
+    (rolling buffer)."""
+    stub_clawx._pty_busy_at = 0.0
+    stub_clawx._maybe_track_busy_marker(b"... esc to inter")
+    assert stub_clawx._pty_busy_at == 0.0  # incomplete: no match yet
+    stub_clawx._maybe_track_busy_marker(b"rupt \xc2\xb7 more ui")
+    assert stub_clawx._pty_busy_at > 0.0
+
+
+def test_busy_marker_buffer_cleared_after_match(stub_clawx):
+    """One old marker must not keep re-matching forever and pin us busy."""
+    stub_clawx._maybe_track_busy_marker(b"esc to interrupt")
+    stub_clawx._pty_busy_at = 0.0
+    stub_clawx._maybe_track_busy_marker(b"plain output, no marker")
+    assert stub_clawx._pty_busy_at == 0.0
+
+
+def _write_jsonl(tmp_path, entries):
+    import json as _json
+    p = tmp_path / "session.jsonl"
+    p.write_text("\n".join(_json.dumps(e) for e in entries))
+    return p
+
+
+def test_turn_complete_true_on_final_assistant_text(stub_clawx, tmp_path):
+    p = _write_jsonl(tmp_path, [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "queue-operation"},   # meta rows after the turn are skipped
+        {"type": "last-prompt"},
+    ])
+    assert stub_clawx._jsonl_turn_complete(p) is True
+
+
+def test_turn_complete_false_on_pending_tool_use(stub_clawx, tmp_path):
+    """The silent-bash case: assistant issued a tool_use, result not back."""
+    p = _write_jsonl(tmp_path, [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1"}]}},
+    ])
+    assert stub_clawx._jsonl_turn_complete(p) is False
+
+
+def test_turn_complete_false_on_user_entry(stub_clawx, tmp_path):
+    """Fresh user message / tool_result → Claude is (about to be) responding."""
+    p = _write_jsonl(tmp_path, [
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]}},
+    ])
+    assert stub_clawx._jsonl_turn_complete(p) is False
+    p2 = _write_jsonl(tmp_path, [
+        {"type": "user", "message": {"content": "hello"}},
+    ])
+    assert stub_clawx._jsonl_turn_complete(p2) is False
+
+
+def test_turn_complete_none_on_garbage_or_missing(stub_clawx, tmp_path):
+    p = tmp_path / "session.jsonl"
+    p.write_text("not json\nalso not json")
+    assert stub_clawx._jsonl_turn_complete(p) is None
+    assert stub_clawx._jsonl_turn_complete(tmp_path / "nope.jsonl") is None
+
+
+def test_gate_blocked_by_turn_in_flight_despite_idle(stub_clawx):
+    """THE fix: hours of PTY silence must not open the gate while the jsonl
+    says a turn is in flight."""
+    now = 10_000.0
+    stub_clawx._pty_busy_at = now - 50_000
+    stub_clawx._pty_last_output_at = now - 50_000
+    assert stub_clawx._queue_inject_gate(now, turn_complete=False) is None
+
+
+def test_gate_open_when_turn_complete_and_idle(stub_clawx):
+    now = 10_000.0
+    stub_clawx._pty_busy_at = now - 100
+    stub_clawx._pty_last_output_at = now - 100
+    assert stub_clawx._queue_inject_gate(now, turn_complete=True) == "ready"
+
+
+def test_gate_unknown_turn_state_keeps_legacy_behavior(stub_clawx):
+    now = 10_000.0
+    stub_clawx._pty_busy_at = now - 100
+    stub_clawx._pty_last_output_at = now - 100
+    assert stub_clawx._queue_inject_gate(now, turn_complete=None) == "ready"
+
+
+def test_find_active_session_jsonl_prefers_project_dir(tmp_path, monkeypatch):
+    """A fresher session in ANOTHER project (the user's own terminal) must
+    not shadow ClawX's session when a project dir is preferred."""
+    import os as real_os, time as real_time
+    proj_root = tmp_path / ".claude" / "projects"
+    ours = proj_root / "-home-ymchang-clawd"
+    theirs = proj_root / "-home-ymchang-other"
+    ours.mkdir(parents=True); theirs.mkdir(parents=True)
+    mine = ours / "aaa.jsonl"; other = theirs / "bbb.jsonl"
+    mine.write_text("{}"); other.write_text("{}")
+    old = real_time.time() - 3600
+    real_os.utime(mine, (old, old))  # ours is OLDER
+    monkeypatch.setattr(clawx.Path, "home", classmethod(lambda cls: tmp_path))
+    got = clawx._find_active_session_jsonl(prefer_project_dir="/home/ymchang/clawd")
+    assert got == mine
+    # without preference, the global most-recent wins
+    assert clawx._find_active_session_jsonl() == other
