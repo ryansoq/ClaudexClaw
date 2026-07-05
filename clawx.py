@@ -134,6 +134,16 @@ QUEUE_TURN_GATE_ENABLED = os.environ.get("CLAWX_QUEUE_TURN_GATE", "1") == "1"
 # gates pass, inject anyway and log loudly.
 QUEUE_WEDGE_OVERRIDE_SECONDS = float(
     os.environ.get("CLAWX_QUEUE_WEDGE_OVERRIDE_SECONDS", "900"))
+# Detector drift alarm (2026-07-05): the busy-marker regex went blind for
+# WEEKS after a CLI UI change and nothing shouted — the logs recorded
+# busy-clear values of 26000-52000s next to obviously active turns. This
+# meta-check makes heuristic breakage loud: if the session jsonl shows turn
+# activity within the window but the busy marker hasn't been seen for the
+# whole window, the detector is probably broken → ERROR log + one TG alert
+# per cooldown.
+DETECTOR_DRIFT_WINDOW_SECONDS = float(
+    os.environ.get("CLAWX_DETECTOR_DRIFT_WINDOW_SECONDS", str(2 * 3600)))
+DETECTOR_DRIFT_ALERT_COOLDOWN_SECONDS = 24 * 3600
 
 # Modal-prompt detection: strip ANSI escape sequences before pattern matching
 # so colored TUI output doesn't fool the detector.
@@ -642,6 +652,8 @@ class ClawX:
         self._pty_busy_at = time.monotonic()
         # Rolling buffer for busy-marker tracking (see _maybe_track_busy_marker).
         self._busy_track_buffer = bytearray()
+        # Detector drift alarm cooldown (epoch seconds).
+        self._drift_alert_cooldown_until = 0.0
 
     def build_command(self):
         """Build the claude CLI command."""
@@ -1510,6 +1522,58 @@ class ClawX:
             return True
         return None
 
+    def _detector_drift_check(self, now_epoch=None, now_mono=None):
+        """Meta-monitor: shout when the busy-marker detector looks blind.
+
+        Fires when ALL hold:
+          - ClawX has been up longer than the window (fresh spawns reset
+            _pty_busy_at, so a short uptime can't prove anything)
+          - the busy marker has NOT been seen for the whole window
+          - the session jsonl WAS modified within the window (turns are
+            actually happening — rules out a genuinely idle night)
+
+        That combination means turns run but the marker never matches —
+        i.e. a CLI UI change probably broke the regex again. ERROR log +
+        one TG alert per 24h cooldown. Called from _health_loop.
+        """
+        if not QUEUE_ENABLED:
+            return
+        now_epoch = time.time() if now_epoch is None else now_epoch
+        now_mono = time.monotonic() if now_mono is None else now_mono
+        if now_epoch < self._drift_alert_cooldown_until:
+            return
+        if self.started_at is None or (
+                (datetime.now() - self.started_at).total_seconds()
+                < DETECTOR_DRIFT_WINDOW_SECONDS):
+            return
+        busy_age = now_mono - self._pty_busy_at
+        if busy_age < DETECTOR_DRIFT_WINDOW_SECONDS:
+            return  # marker seen recently — detector healthy
+        jsonl = _find_active_session_jsonl(
+            prefer_project_dir=self._get_project_dir())
+        if jsonl is None:
+            return
+        try:
+            jsonl_age = now_epoch - jsonl.stat().st_mtime
+        except OSError:
+            return
+        if jsonl_age > DETECTOR_DRIFT_WINDOW_SECONDS:
+            return  # no turn activity either — genuinely idle, not drift
+        self._drift_alert_cooldown_until = (
+            now_epoch + DETECTOR_DRIFT_ALERT_COOLDOWN_SECONDS)
+        self.logger.error(
+            f"[DetectorDrift] busy marker unseen for {busy_age/3600:.1f}h "
+            f"but session jsonl active {jsonl_age/60:.0f}min ago — the "
+            f"busy-marker regex may be broken by a CLI update. Queue is "
+            f"running on idle-timers only; check [Queue] popping "
+            f"busy-clear values.")
+        self._send_telegram(
+            "⚠️ ClawX 偵測器漂移警報：busy marker 已 "
+            f"{busy_age/3600:.1f} 小時沒偵測到，但 session 明明有活動 — "
+            "CLI 改版可能又弄壞了忙碌偵測，queue 目前只剩計時器保護。"
+            "請查 log 的 busy-clear 數值。",
+            tag="DetectorDrift")
+
     def _is_alive(self):
         """Check if the child process is still running.
 
@@ -1622,6 +1686,11 @@ class ClawX:
                     self._scheduler_watchdog()
                 except Exception:
                     self.logger.exception("[Watchdog] check failed (non-fatal)")
+                try:
+                    self._detector_drift_check()
+                except Exception:
+                    self.logger.exception(
+                        "[DetectorDrift] check failed (non-fatal)")
             else:
                 # Child not alive. Respawn is owned by the main run() loop
                 # now (single-owner lifecycle) so the two threads can't race

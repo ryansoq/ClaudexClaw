@@ -732,3 +732,67 @@ def test_find_active_session_jsonl_prefers_project_dir(tmp_path, monkeypatch):
     assert got == mine
     # without preference, the global most-recent wins
     assert clawx._find_active_session_jsonl() == other
+
+
+# ── 2026-07-05: detector drift alarm ──
+# (the busy regex was blind for weeks and nothing shouted; this meta-check
+#  fires when the jsonl shows turns but the marker is never seen)
+
+def _drift_setup(cx, tmp_path, monkeypatch, *, busy_age, jsonl_age, uptime):
+    import os as real_os, time as real_time
+    now_mono, now_epoch = 100_000.0, real_time.time()
+    cx.started_at = datetime.now() - timedelta(seconds=uptime)
+    cx._pty_busy_at = now_mono - busy_age
+    cx._drift_alert_cooldown_until = 0.0
+    cx._send_telegram = MagicMock()
+    jsonl = tmp_path / "s.jsonl"
+    jsonl.write_text("{}")
+    mt = now_epoch - jsonl_age
+    real_os.utime(jsonl, (mt, mt))
+    monkeypatch.setattr(clawx, "_find_active_session_jsonl",
+                        lambda prefer_project_dir=None: jsonl)
+    return now_epoch, now_mono
+
+
+def test_drift_fires_when_turns_active_but_marker_blind(stub_clawx, tmp_path, monkeypatch):
+    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
+    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
+                          busy_age=W * 3, jsonl_age=60, uptime=W * 3)
+    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
+    stub_clawx._send_telegram.assert_called_once()
+    assert stub_clawx._drift_alert_cooldown_until > ep  # cooldown armed
+
+
+def test_drift_silent_when_marker_recent(stub_clawx, tmp_path, monkeypatch):
+    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
+    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
+                          busy_age=60, jsonl_age=60, uptime=W * 3)
+    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
+    stub_clawx._send_telegram.assert_not_called()
+
+
+def test_drift_silent_when_genuinely_idle(stub_clawx, tmp_path, monkeypatch):
+    """No jsonl activity either → quiet night, not a broken detector."""
+    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
+    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
+                          busy_age=W * 3, jsonl_age=W * 3, uptime=W * 4)
+    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
+    stub_clawx._send_telegram.assert_not_called()
+
+
+def test_drift_silent_during_short_uptime(stub_clawx, tmp_path, monkeypatch):
+    """Fresh spawn resets _pty_busy_at — short uptime proves nothing."""
+    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
+    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
+                          busy_age=W * 3, jsonl_age=60, uptime=W / 2)
+    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
+    stub_clawx._send_telegram.assert_not_called()
+
+
+def test_drift_respects_cooldown(stub_clawx, tmp_path, monkeypatch):
+    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
+    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
+                          busy_age=W * 3, jsonl_age=60, uptime=W * 3)
+    stub_clawx._drift_alert_cooldown_until = ep + 999
+    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
+    stub_clawx._send_telegram.assert_not_called()
