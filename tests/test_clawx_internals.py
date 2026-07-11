@@ -796,3 +796,41 @@ def test_drift_respects_cooldown(stub_clawx, tmp_path, monkeypatch):
     stub_clawx._drift_alert_cooldown_until = ep + 999
     stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
     stub_clawx._send_telegram.assert_not_called()
+
+
+# ── 2026-07-06: turn-gate staleness — fix the user-entry deadlock ──
+# (an injected prompt the CLI swallowed/batched left "user" as the last
+#  entry forever; gate pinned False → the whole day ran on 900s wedge pops)
+
+def test_turn_complete_user_fresh_is_busy(stub_clawx, tmp_path):
+    import os as real_os, time as real_time
+    p = _write_jsonl(tmp_path, [
+        {"type": "user", "message": {"content": "injected prompt"}},
+    ])
+    now = real_time.time()
+    real_os.utime(p, (now, now))  # written just now → model responding
+    assert stub_clawx._jsonl_turn_complete(p) is False
+
+
+def test_turn_complete_user_stale_is_unknown(stub_clawx, tmp_path):
+    """Unanswered user entry + stale file = dead turn → None (time gates
+    take over) instead of the False that deadlocked the queue on 07/06."""
+    import os as real_os, time as real_time
+    p = _write_jsonl(tmp_path, [
+        {"type": "user", "message": {"content": "swallowed prompt"}},
+    ])
+    old = real_time.time() - (clawx.QUEUE_TURN_STALE_SECONDS + 60)
+    real_os.utime(p, (old, old))
+    assert stub_clawx._jsonl_turn_complete(p) is None
+
+
+def test_turn_complete_stale_tool_use_still_busy(stub_clawx, tmp_path):
+    """Pending tool_use stays False even when stale — long silent tools
+    are legitimate; the 900s wedge override bounds them."""
+    import os as real_os, time as real_time
+    p = _write_jsonl(tmp_path, [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1"}]}},
+    ])
+    old = real_time.time() - (clawx.QUEUE_TURN_STALE_SECONDS + 60)
+    real_os.utime(p, (old, old))
+    assert stub_clawx._jsonl_turn_complete(p) is False

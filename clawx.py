@@ -134,6 +134,18 @@ QUEUE_TURN_GATE_ENABLED = os.environ.get("CLAWX_QUEUE_TURN_GATE", "1") == "1"
 # gates pass, inject anyway and log loudly.
 QUEUE_WEDGE_OVERRIDE_SECONDS = float(
     os.environ.get("CLAWX_QUEUE_WEDGE_OVERRIDE_SECONDS", "900"))
+# Turn-gate staleness (2026-07-06): "last entry is user → busy" DEADLOCKS
+# when the CLI swallows/queues an injected prompt without ever starting a
+# turn — the unanswered user entry pins the gate False, every wedge
+# override adds another user entry, and the whole day runs on 900s wedge
+# pops (observed 07/06: every single pop was gate=wedge-override). If the
+# last entry is a USER row but the jsonl hasn't been written for this
+# long, the turn evidently never started/died — treat as unknown (None)
+# so the time gates take over. Pending assistant tool_use stays False
+# regardless of staleness: long silent tools are legitimate and bounded
+# by the wedge override.
+QUEUE_TURN_STALE_SECONDS = float(
+    os.environ.get("CLAWX_QUEUE_TURN_STALE_SECONDS", "300"))
 # Detector drift alarm (2026-07-05): the busy-marker regex went blind for
 # WEEKS after a CLI UI change and nothing shouted — the logs recorded
 # busy-clear values of 26000-52000s next to obviously active turns. This
@@ -1484,9 +1496,17 @@ class ClawX:
 
           assistant, plain text/thinking → True  (turn finished)
           assistant containing tool_use  → False (tool in flight — the
-                                                  silent-bash case)
-          user (new prompt / tool_result)→ False (Claude is about to
+                                                  silent-bash case; stays
+                                                  False even when stale,
+                                                  wedge override bounds it)
+          user, jsonl written recently   → False (Claude is about to
                                                   respond or continue)
+          user, jsonl stale ≥300s        → None  (turn never started or
+                                                  died — the CLI swallowed
+                                                  or batched the prompt;
+                                                  without this the gate
+                                                  deadlocks, see
+                                                  QUEUE_TURN_STALE_SECONDS)
           nothing parseable / no file    → None  (unknown — caller falls
                                                   back to time gates)
         """
@@ -1502,6 +1522,7 @@ class ClawX:
                 chunk = min(size, 64 * 1024)
                 f.seek(size - chunk)
                 tail = f.read()
+            mtime_age = time.time() - Path(jsonl_path).stat().st_mtime
         except OSError:
             return None
         for raw in reversed(tail.splitlines()):
@@ -1513,6 +1534,8 @@ class ClawX:
             if etype not in ("user", "assistant"):
                 continue
             if etype == "user":
+                if mtime_age >= QUEUE_TURN_STALE_SECONDS:
+                    return None  # unanswered prompt — turn dead, not busy
                 return False
             content = (entry.get("message") or {}).get("content")
             if isinstance(content, list) and any(
