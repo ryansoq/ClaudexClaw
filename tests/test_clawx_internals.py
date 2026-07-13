@@ -409,68 +409,6 @@ def test_inject_no_debounce_when_idle_long_enough(stub_clawx):
 
 # --- HYP #3 busy-marker queue gate (2026-05-22) -----------------------------
 
-def test_busy_marker_tracking_sets_timestamp(stub_clawx):
-    """_maybe_track_busy_marker bumps _pty_busy_at when Claude's
-    'esc to interrupt' marker appears (even buried in ANSI), and leaves it
-    untouched for ordinary output.
-    """
-    stub_clawx._pty_busy_at = 0.0
-    # ANSI-wrapped busy marker — the regex must see it after stripping.
-    stub_clawx._maybe_track_busy_marker(b"\x1b[2m\x1b[38;5;244m(esc to interrupt)\x1b[0m")
-    assert stub_clawx._pty_busy_at > 0.0
-
-    # Plain output without the marker must NOT bump it.
-    stub_clawx._pty_busy_at = 0.0
-    stub_clawx._maybe_track_busy_marker(b"some ordinary tool output line\n")
-    assert stub_clawx._pty_busy_at == 0.0
-
-
-def test_queue_gate_defers_during_silent_bash(stub_clawx):
-    """The bug this fixes: a quiet long bash produces no PTY output for a
-    few seconds, but Claude IS busy (spinner + 'esc to interrupt' animating).
-    The busy marker is fresh, so the gate must return None (do not inject)
-    even though output has been idle past the short ready-idle window.
-    """
-    now = 10_000.0
-    # No output for 5s (> QUEUE_READY_IDLE_SECONDS) ...
-    stub_clawx._pty_last_output_at = now - 5.0
-    # ... but busy marker seen 0.5s ago (spinner still animating).
-    stub_clawx._pty_busy_at = now - 0.5
-    assert stub_clawx._queue_inject_gate(now) is None
-
-
-def test_queue_gate_ready_after_busy_clears(stub_clawx):
-    """Once the busy marker has been gone QUEUE_BUSY_CLEAR_SECONDS and output
-    is also quiet QUEUE_READY_IDLE_SECONDS, the 'ready' gate opens.
-    """
-    now = 10_000.0
-    stub_clawx._pty_last_output_at = now - (clawx.QUEUE_READY_IDLE_SECONDS + 1)
-    stub_clawx._pty_busy_at = now - (clawx.QUEUE_BUSY_CLEAR_SECONDS + 1)
-    assert stub_clawx._queue_inject_gate(now) == "ready"
-
-
-def test_queue_gate_idle_fallback_when_busy_marker_stuck(stub_clawx):
-    """Fallback path: if the busy marker stays fresh (e.g. a hung spinner or
-    a UI quirk that keeps redrawing 'esc to interrupt') but there has been NO
-    output for the full 60s window, the idle-fallback still releases the
-    prompt so the queue can never wedge permanently.
-    """
-    now = 10_000.0
-    # Busy marker seen recently (busy-clear gate NOT satisfied) ...
-    stub_clawx._pty_busy_at = now - 1.0
-    # ... yet no actual output for > QUEUE_IDLE_SECONDS.
-    stub_clawx._pty_last_output_at = now - (clawx.QUEUE_IDLE_SECONDS + 1)
-    assert stub_clawx._queue_inject_gate(now) == "idle-fallback"
-
-
-def test_queue_gate_nothing_when_streaming(stub_clawx):
-    """Active streaming: fresh output AND fresh busy marker → no inject."""
-    now = 10_000.0
-    stub_clawx._pty_busy_at = now - 0.2
-    stub_clawx._pty_last_output_at = now - 0.2
-    assert stub_clawx._queue_inject_gate(now) is None
-
-
 # ── 2026-07-04 review fixes: clean-exit, backoff, queue-while-dead, ──
 # ── double-start guard, transcript prune                            ──
 
@@ -617,102 +555,11 @@ def test_prune_disabled_with_zero_keep_days(stub_clawx, tmp_path, monkeypatch):
 #  line renders with cursor moves, not spaces — "esctointerrupt" after
 #  ANSI strip — so the spaced regex never matched all session.)
 
-def test_busy_marker_matches_new_cursor_move_rendering(stub_clawx):
-    """v2.1.x: words separated by cursor-forward ANSI, not spaces."""
-    stub_clawx._pty_busy_at = 0.0
-    chunk = b"(shift+tab \x1b[1mto\x1b[0m cycle) \xc2\xb7 esc\x1b[1Cto\x1b[1Cinterrupt \xc2\xb7 \xe2\x86\x90 for agents"
-    stub_clawx._maybe_track_busy_marker(chunk)
-    assert stub_clawx._pty_busy_at > 0.0
-
-
-def test_busy_marker_still_matches_old_spaced_rendering(stub_clawx):
-    stub_clawx._pty_busy_at = 0.0
-    stub_clawx._maybe_track_busy_marker(b"spinner... esc to interrupt)")
-    assert stub_clawx._pty_busy_at > 0.0
-
-
-def test_busy_marker_survives_chunk_split(stub_clawx):
-    """The marker arriving across two 4096-byte PTY reads must still match
-    (rolling buffer)."""
-    stub_clawx._pty_busy_at = 0.0
-    stub_clawx._maybe_track_busy_marker(b"... esc to inter")
-    assert stub_clawx._pty_busy_at == 0.0  # incomplete: no match yet
-    stub_clawx._maybe_track_busy_marker(b"rupt \xc2\xb7 more ui")
-    assert stub_clawx._pty_busy_at > 0.0
-
-
-def test_busy_marker_buffer_cleared_after_match(stub_clawx):
-    """One old marker must not keep re-matching forever and pin us busy."""
-    stub_clawx._maybe_track_busy_marker(b"esc to interrupt")
-    stub_clawx._pty_busy_at = 0.0
-    stub_clawx._maybe_track_busy_marker(b"plain output, no marker")
-    assert stub_clawx._pty_busy_at == 0.0
-
-
 def _write_jsonl(tmp_path, entries):
     import json as _json
     p = tmp_path / "session.jsonl"
     p.write_text("\n".join(_json.dumps(e) for e in entries))
     return p
-
-
-def test_turn_complete_true_on_final_assistant_text(stub_clawx, tmp_path):
-    p = _write_jsonl(tmp_path, [
-        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
-        {"type": "queue-operation"},   # meta rows after the turn are skipped
-        {"type": "last-prompt"},
-    ])
-    assert stub_clawx._jsonl_turn_complete(p) is True
-
-
-def test_turn_complete_false_on_pending_tool_use(stub_clawx, tmp_path):
-    """The silent-bash case: assistant issued a tool_use, result not back."""
-    p = _write_jsonl(tmp_path, [
-        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1"}]}},
-    ])
-    assert stub_clawx._jsonl_turn_complete(p) is False
-
-
-def test_turn_complete_false_on_user_entry(stub_clawx, tmp_path):
-    """Fresh user message / tool_result → Claude is (about to be) responding."""
-    p = _write_jsonl(tmp_path, [
-        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]}},
-    ])
-    assert stub_clawx._jsonl_turn_complete(p) is False
-    p2 = _write_jsonl(tmp_path, [
-        {"type": "user", "message": {"content": "hello"}},
-    ])
-    assert stub_clawx._jsonl_turn_complete(p2) is False
-
-
-def test_turn_complete_none_on_garbage_or_missing(stub_clawx, tmp_path):
-    p = tmp_path / "session.jsonl"
-    p.write_text("not json\nalso not json")
-    assert stub_clawx._jsonl_turn_complete(p) is None
-    assert stub_clawx._jsonl_turn_complete(tmp_path / "nope.jsonl") is None
-
-
-def test_gate_blocked_by_turn_in_flight_despite_idle(stub_clawx):
-    """THE fix: hours of PTY silence must not open the gate while the jsonl
-    says a turn is in flight."""
-    now = 10_000.0
-    stub_clawx._pty_busy_at = now - 50_000
-    stub_clawx._pty_last_output_at = now - 50_000
-    assert stub_clawx._queue_inject_gate(now, turn_complete=False) is None
-
-
-def test_gate_open_when_turn_complete_and_idle(stub_clawx):
-    now = 10_000.0
-    stub_clawx._pty_busy_at = now - 100
-    stub_clawx._pty_last_output_at = now - 100
-    assert stub_clawx._queue_inject_gate(now, turn_complete=True) == "ready"
-
-
-def test_gate_unknown_turn_state_keeps_legacy_behavior(stub_clawx):
-    now = 10_000.0
-    stub_clawx._pty_busy_at = now - 100
-    stub_clawx._pty_last_output_at = now - 100
-    assert stub_clawx._queue_inject_gate(now, turn_complete=None) == "ready"
 
 
 def test_find_active_session_jsonl_prefers_project_dir(tmp_path, monkeypatch):
@@ -738,99 +585,220 @@ def test_find_active_session_jsonl_prefers_project_dir(tmp_path, monkeypatch):
 # (the busy regex was blind for weeks and nothing shouted; this meta-check
 #  fires when the jsonl shows turns but the marker is never seen)
 
-def _drift_setup(cx, tmp_path, monkeypatch, *, busy_age, jsonl_age, uptime):
-    import os as real_os, time as real_time
-    now_mono, now_epoch = 100_000.0, real_time.time()
-    cx.started_at = datetime.now() - timedelta(seconds=uptime)
-    cx._pty_busy_at = now_mono - busy_age
-    cx._drift_alert_cooldown_until = 0.0
-    cx._send_telegram = MagicMock()
-    jsonl = tmp_path / "s.jsonl"
-    jsonl.write_text("{}")
-    mt = now_epoch - jsonl_age
-    real_os.utime(jsonl, (mt, mt))
-    monkeypatch.setattr(clawx, "_find_active_session_jsonl",
-                        lambda prefer_project_dir=None: jsonl)
-    return now_epoch, now_mono
-
-
-def test_drift_fires_when_turns_active_but_marker_blind(stub_clawx, tmp_path, monkeypatch):
-    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
-    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
-                          busy_age=W * 3, jsonl_age=60, uptime=W * 3)
-    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
-    stub_clawx._send_telegram.assert_called_once()
-    assert stub_clawx._drift_alert_cooldown_until > ep  # cooldown armed
-
-
-def test_drift_silent_when_marker_recent(stub_clawx, tmp_path, monkeypatch):
-    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
-    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
-                          busy_age=60, jsonl_age=60, uptime=W * 3)
-    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
-    stub_clawx._send_telegram.assert_not_called()
-
-
-def test_drift_silent_when_genuinely_idle(stub_clawx, tmp_path, monkeypatch):
-    """No jsonl activity either → quiet night, not a broken detector."""
-    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
-    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
-                          busy_age=W * 3, jsonl_age=W * 3, uptime=W * 4)
-    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
-    stub_clawx._send_telegram.assert_not_called()
-
-
-def test_drift_silent_during_short_uptime(stub_clawx, tmp_path, monkeypatch):
-    """Fresh spawn resets _pty_busy_at — short uptime proves nothing."""
-    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
-    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
-                          busy_age=W * 3, jsonl_age=60, uptime=W / 2)
-    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
-    stub_clawx._send_telegram.assert_not_called()
-
-
-def test_drift_respects_cooldown(stub_clawx, tmp_path, monkeypatch):
-    W = clawx.DETECTOR_DRIFT_WINDOW_SECONDS
-    ep, mo = _drift_setup(stub_clawx, tmp_path, monkeypatch,
-                          busy_age=W * 3, jsonl_age=60, uptime=W * 3)
-    stub_clawx._drift_alert_cooldown_until = ep + 999
-    stub_clawx._detector_drift_check(now_epoch=ep, now_mono=mo)
-    stub_clawx._send_telegram.assert_not_called()
-
-
 # ── 2026-07-06: turn-gate staleness — fix the user-entry deadlock ──
 # (an injected prompt the CLI swallowed/batched left "user" as the last
 #  entry forever; gate pinned False → the whole day ran on 900s wedge pops)
 
-def test_turn_complete_user_fresh_is_busy(stub_clawx, tmp_path):
+# ── 2026-07-13: single-oracle turn gate (consolidation refactor) ──
+# Replaces busy-marker regex + ready/idle-fallback gates + drift alarm
+# with: session pinning by injection correlation + one _turn_state()
+# oracle + a pure _queue_pop_decision policy + wedge anomaly alert.
+
+def _write_jsonl(tmp_path, entries, name="session.jsonl"):
+    import json as _json
+    p = tmp_path / name
+    p.write_text("\n".join(_json.dumps(e) for e in entries))
+    return p
+
+
+def _fresh(p):
     import os as real_os, time as real_time
-    p = _write_jsonl(tmp_path, [
-        {"type": "user", "message": {"content": "injected prompt"}},
-    ])
     now = real_time.time()
-    real_os.utime(p, (now, now))  # written just now → model responding
-    assert stub_clawx._jsonl_turn_complete(p) is False
+    real_os.utime(p, (now, now))
+    return p
 
 
-def test_turn_complete_user_stale_is_unknown(stub_clawx, tmp_path):
-    """Unanswered user entry + stale file = dead turn → None (time gates
-    take over) instead of the False that deadlocked the queue on 07/06."""
+def _stale(p):
     import os as real_os, time as real_time
-    p = _write_jsonl(tmp_path, [
-        {"type": "user", "message": {"content": "swallowed prompt"}},
-    ])
     old = real_time.time() - (clawx.QUEUE_TURN_STALE_SECONDS + 60)
     real_os.utime(p, (old, old))
-    assert stub_clawx._jsonl_turn_complete(p) is None
+    return p
 
 
-def test_turn_complete_stale_tool_use_still_busy(stub_clawx, tmp_path):
-    """Pending tool_use stays False even when stale — long silent tools
-    are legitimate; the 900s wedge override bounds them."""
-    import os as real_os, time as real_time
-    p = _write_jsonl(tmp_path, [
+# — _turn_state oracle —
+
+def test_turn_state_unknown_while_unpinned(stub_clawx):
+    stub_clawx._pinned_jsonl = None
+    assert stub_clawx._turn_state() == ClawX.TURN_UNKNOWN
+
+
+def test_turn_state_done_on_final_assistant_text(stub_clawx, tmp_path):
+    p = _fresh(_write_jsonl(tmp_path, [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "queue-operation"},
+        {"type": "last-prompt"},
+    ]))
+    assert stub_clawx._turn_state(p) == ClawX.TURN_DONE
+
+
+def test_turn_state_active_on_pending_tool_use_even_stale(stub_clawx, tmp_path):
+    """Long silent tools are legitimate — ACTIVE regardless of staleness."""
+    p = _stale(_write_jsonl(tmp_path, [
         {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1"}]}},
-    ])
-    old = real_time.time() - (clawx.QUEUE_TURN_STALE_SECONDS + 60)
-    real_os.utime(p, (old, old))
-    assert stub_clawx._jsonl_turn_complete(p) is False
+    ]))
+    assert stub_clawx._turn_state(p) == ClawX.TURN_ACTIVE
+
+
+def test_turn_state_active_on_fresh_user(stub_clawx, tmp_path):
+    p = _fresh(_write_jsonl(tmp_path, [
+        {"type": "user", "message": {"content": "injected prompt"}},
+    ]))
+    assert stub_clawx._turn_state(p) == ClawX.TURN_ACTIVE
+
+
+def test_turn_state_unknown_on_stale_user(stub_clawx, tmp_path):
+    """Swallowed/batched prompt: unanswered user row + stale file must NOT
+    pin ACTIVE (the 07/06 deadlock)."""
+    p = _stale(_write_jsonl(tmp_path, [
+        {"type": "user", "message": {"content": "swallowed"}},
+    ]))
+    assert stub_clawx._turn_state(p) == ClawX.TURN_UNKNOWN
+
+
+def test_turn_state_skips_meta_user_rows(stub_clawx, tmp_path):
+    """THE 07/13 review fix: isMeta rows (TG channel deliveries — 28/475
+    user rows in a live session) must not read as unanswered prompts."""
+    p = _fresh(_write_jsonl(tmp_path, [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "user", "isMeta": True, "message": {"content": "<channel …TG…>"}},
+    ]))
+    assert stub_clawx._turn_state(p) == ClawX.TURN_DONE
+
+
+def test_turn_state_skips_sidechain_rows(stub_clawx, tmp_path):
+    """Subagent (sidechain) rows must not flip the gate mid-parent-turn."""
+    p = _fresh(_write_jsonl(tmp_path, [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "task1"}]}},
+        {"type": "assistant", "isSidechain": True,
+         "message": {"content": [{"type": "text", "text": "subagent done"}]}},
+    ]))
+    assert stub_clawx._turn_state(p) == ClawX.TURN_ACTIVE
+
+
+def test_turn_state_unknown_on_garbage_and_unpins_on_missing(stub_clawx, tmp_path):
+    p = tmp_path / "s.jsonl"
+    p.write_text("not json\nstill not json")
+    assert stub_clawx._turn_state(p) == ClawX.TURN_UNKNOWN
+    missing = tmp_path / "gone.jsonl"
+    stub_clawx._pinned_jsonl = missing
+    assert stub_clawx._turn_state() == ClawX.TURN_UNKNOWN
+    assert stub_clawx._pinned_jsonl is None  # bad pin dropped
+
+
+# — _queue_pop_decision policy —
+
+def test_pop_done_after_settle(stub_clawx):
+    now = 10_000.0
+    stub_clawx._pty_last_output_at = now - (clawx.QUEUE_DONE_SETTLE_SECONDS + 1)
+    assert stub_clawx._queue_pop_decision(now, ClawX.TURN_DONE, now - 5) == "done"
+    stub_clawx._pty_last_output_at = now - 1
+    assert stub_clawx._queue_pop_decision(now, ClawX.TURN_DONE, now - 5) is None
+
+
+def test_pop_unknown_needs_full_idle(stub_clawx):
+    now = 10_000.0
+    stub_clawx._pty_last_output_at = now - (clawx.QUEUE_IDLE_SECONDS + 1)
+    assert stub_clawx._queue_pop_decision(now, ClawX.TURN_UNKNOWN, now - 5) == "idle"
+    stub_clawx._pty_last_output_at = now - (clawx.QUEUE_IDLE_SECONDS - 5)
+    assert stub_clawx._queue_pop_decision(now, ClawX.TURN_UNKNOWN, now - 5) is None
+
+
+def test_pop_active_blocks_even_when_very_idle(stub_clawx):
+    """A pending tool with hours of PTY silence must NOT inject before the
+    wedge window — the silent-long-bash guarantee."""
+    now = 10_000.0
+    stub_clawx._pty_last_output_at = now - 5_000
+    assert stub_clawx._queue_pop_decision(
+        now, ClawX.TURN_ACTIVE, now - 100) is None
+
+
+def test_pop_active_wedge_needs_wait_AND_quiet(stub_clawx):
+    now = 100_000.0
+    old = now - (clawx.QUEUE_WEDGE_OVERRIDE_SECONDS + 10)
+    # waited long enough + quiet PTY → wedge
+    stub_clawx._pty_last_output_at = now - (clawx.QUEUE_IDLE_SECONDS + 1)
+    assert stub_clawx._queue_pop_decision(now, ClawX.TURN_ACTIVE, old) == "wedge"
+    # waited long enough but PTY still rendering (spinner) → keep waiting:
+    # a genuinely working turn produces output
+    stub_clawx._pty_last_output_at = now - 2
+    assert stub_clawx._queue_pop_decision(now, ClawX.TURN_ACTIVE, old) is None
+
+
+# — session pinning by injection correlation —
+
+def _probe_env(stub_clawx, tmp_path, monkeypatch):
+    proj = tmp_path / ".claude" / "projects" / "-home-ymchang-clawd"
+    proj.mkdir(parents=True)
+    monkeypatch.setattr(clawx.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(stub_clawx, "_get_project_dir", lambda: "/home/ymchang/clawd")
+    return proj
+
+
+def test_pin_correlates_single_grown_file(stub_clawx, tmp_path, monkeypatch):
+    proj = _probe_env(stub_clawx, tmp_path, monkeypatch)
+    ours = proj / "ours.jsonl"; theirs = proj / "theirs.jsonl"
+    ours.write_text("a"); theirs.write_text("b")
+    stub_clawx._arm_pin_probe()
+    assert set(stub_clawx._pin_probe) == {ours, theirs}
+    ours.write_text("a" * 100)          # only OUR file grew after inject
+    stub_clawx._pin_probe_at = 0.0      # probe old enough
+    stub_clawx._maybe_pin_session()
+    assert stub_clawx._pinned_jsonl == ours
+
+
+def test_pin_ambiguous_when_both_grow(stub_clawx, tmp_path, monkeypatch):
+    """Concurrent session in the SAME dir also active → don't guess."""
+    proj = _probe_env(stub_clawx, tmp_path, monkeypatch)
+    ours = proj / "ours.jsonl"; theirs = proj / "theirs.jsonl"
+    ours.write_text("a"); theirs.write_text("b")
+    stub_clawx._arm_pin_probe()
+    ours.write_text("a" * 100); theirs.write_text("b" * 100)
+    stub_clawx._pin_probe_at = 0.0
+    stub_clawx._maybe_pin_session()
+    assert stub_clawx._pinned_jsonl is None
+    assert stub_clawx._pin_probe is None  # probe consumed; next inject rearms
+
+
+def test_pin_detects_brand_new_session_file(stub_clawx, tmp_path, monkeypatch):
+    proj = _probe_env(stub_clawx, tmp_path, monkeypatch)
+    stub_clawx._arm_pin_probe()          # empty dir snapshot
+    fresh = proj / "new.jsonl"; fresh.write_text("x")
+    stub_clawx._pin_probe_at = 0.0
+    stub_clawx._maybe_pin_session()
+    assert stub_clawx._pinned_jsonl == fresh
+
+
+def test_pin_probe_waits_min_age(stub_clawx, tmp_path, monkeypatch):
+    proj = _probe_env(stub_clawx, tmp_path, monkeypatch)
+    f = proj / "s.jsonl"; f.write_text("a")
+    stub_clawx._arm_pin_probe()
+    f.write_text("a" * 50)
+    # probe just armed → too young to judge
+    stub_clawx._maybe_pin_session()
+    assert stub_clawx._pinned_jsonl is None
+    assert stub_clawx._pin_probe is not None  # kept for the next tick
+
+
+# — wedge anomaly alert (successor to the drift alarm) —
+
+def test_wedge_alert_fires_on_repeats(stub_clawx):
+    stub_clawx._send_telegram = MagicMock()
+    stub_clawx._note_wedge_pop()
+    stub_clawx._send_telegram.assert_not_called()   # 1 pop = no alert
+    stub_clawx._note_wedge_pop()
+    stub_clawx._send_telegram.assert_called_once()  # 2 within window
+    stub_clawx._note_wedge_pop()
+    stub_clawx._send_telegram.assert_called_once()  # cooldown holds
+
+
+# — compact verifier accepts a pinned path —
+
+def test_verify_compact_uses_explicit_path(tmp_path):
+    import json as _json, datetime as _dt
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    p = tmp_path / "pinned.jsonl"
+    p.write_text(_json.dumps({"isCompactSummary": True, "timestamp": ts}))
+    assert clawx._verify_compact_in_jsonl(jsonl_path=p) is True
+    q = tmp_path / "other.jsonl"
+    q.write_text(_json.dumps({"type": "assistant"}))
+    assert clawx._verify_compact_in_jsonl(jsonl_path=q) is False

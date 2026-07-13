@@ -90,72 +90,56 @@ INJECT_GAP_SECONDS = float(os.environ.get("CLAWX_INJECT_GAP_SECONDS", "30"))
 # tool). Defaults: off (preserves current behavior); set
 # CLAWX_QUEUE_ENABLED=1 to opt in.
 QUEUE_ENABLED = os.environ.get("CLAWX_QUEUE_ENABLED", "1") == "1"
-QUEUE_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_IDLE_SECONDS", "60.0"))  # 5→60s 2026-05-21. 5s falsely fires during silent long bash (cloudflared connect, yfinance fetch, Python imports). Each schedule fires every 15min+ → 60s idle delay is negligible cost vs cancelled morning-report bashes.
 QUEUE_MAX_DEPTH = int(os.environ.get("CLAWX_QUEUE_MAX_DEPTH", "10"))
-# HYP #3 (2026-05-22): how long the BUSY marker ("esc to interrupt") must be
-# absent before the queue may inject. Short, because the marker re-appears
-# every spinner frame (~sub-second) while Claude works; a few seconds of
-# absence reliably means the response/tool finished.
-QUEUE_BUSY_CLEAR_SECONDS = float(os.environ.get("CLAWX_QUEUE_BUSY_CLEAR_SECONDS", "4.0"))
-# Idle gate paired with the busy-clear check (output also quiet).
-# Raised 3→45s (2026-07-01): the 3s gate falsely fired during multi-step tasks
-# like the morning report, which runs steps as BACKGROUND bashes. While waiting
-# for a background result the PTY is fully silent (no output, no spinner), so
-# after 3s idle + 4s busy-clear the queue judged the turn "finished" and popped
-# the next scheduled prompt — interrupting the half-sent report. 45s comfortably
-# exceeds the gaps between morning-report steps; cost is negligible since each
-# schedule fires every 15min+. (Root fix would be a multi-step task lock — see
-# backlog; this threshold bump is the cheap 1-line mitigation Ryan approved.)
-QUEUE_READY_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_READY_IDLE_SECONDS", "45.0"))
-# BUSY marker: Claude Code shows "esc to interrupt" while streaming a
-# response or running a tool. Matched on ANSI-stripped, WHITESPACE-SQUASHED
-# output: newer CLI versions (observed v2.1.201, 2026-07-05) render the
-# status line with cursor-forward moves instead of literal spaces, so after
-# ANSI stripping the marker reads "esctointerrupt" — the old spaced regex
-# never matched and _pty_busy_at stayed frozen at spawn time (busy-clear
-# 26000-52000s in logs), leaving the 45s idle timer as the only gate and
-# letting queued prompts interrupt long silent tool calls. Squashing all
-# whitespace before matching covers both old and new renderings.
-_BUSY_MARKER_RE = re.compile(rb"esctointerrupt|tointerrupt\)")
-_WS_RE = re.compile(rb"\s+")
-# Rolling-buffer cap for busy-marker tracking (marker may split across
-# 4096-byte PTY read chunks).
-_BUSY_TRACK_BUFFER_LIMIT = 4096
 
-# Ground-truth turn gate (2026-07-05): before injecting a queued prompt,
-# check the active session jsonl — Claude CLI appends an assistant entry
-# with a tool_use block when a tool starts and a user/tool_result entry
-# when it finishes, so "last real entry is a plain-text assistant message"
-# is a reliable "turn finished" signal that survives silent bashes and UI
-# redesigns. Set CLAWX_QUEUE_TURN_GATE=0 to fall back to time gates only.
+# ── Single-oracle turn gate (2026-07-13 consolidation) ──────────────────
+#
+# History: the queue grew five interacting mechanisms (busy-marker regex
+# 4s clear + 45s ready-idle + 60s idle-fallback + jsonl gate w/ 300s
+# staleness + 900s wedge), each patching the previous patch. A multi-agent
+# review found the layering itself was the bug: the idle-fallback was
+# provably dead code, the busy regex silently broke on CLI UI updates
+# (twice), and the jsonl gate read the WRONG session whenever another
+# claude ran in the same project dir. This consolidation replaces all of
+# it with ONE oracle:
+#
+#   _turn_state() → ACTIVE / DONE / UNKNOWN, read from OUR OWN session
+#   jsonl (pinned by injection-correlation, never by mtime guessing),
+#   skipping isMeta rows (TG channel deliveries — 28/475 user rows in a
+#   real session) and isSidechain rows (subagents).
+#
+# Injection policy (_queue_pop_decision):
+#   DONE    + PTY quiet ≥ QUEUE_DONE_SETTLE_SECONDS  → inject ("done")
+#   UNKNOWN + PTY quiet ≥ QUEUE_IDLE_SECONDS         → inject ("idle")
+#   ACTIVE  → never; legit long tools (training runs) may run hours.
+#             If the oldest item has waited ≥ WEDGE seconds AND the PTY
+#             has been quiet ≥ QUEUE_IDLE_SECONDS, force ("wedge") with a
+#             WARNING — that combination means the "ACTIVE" reading is
+#             probably wrong (stuck tool / oracle misread), because a
+#             genuinely working turn produces output or spinner frames.
+#
+# Anomaly signal: repeated wedge pops within an hour raise one TG alert
+# per day — the successor to the old detector-drift alarm, but watching
+# the oracle itself instead of a regex.
+QUEUE_IDLE_SECONDS = float(os.environ.get("CLAWX_QUEUE_IDLE_SECONDS", "60.0"))
+QUEUE_DONE_SETTLE_SECONDS = float(
+    os.environ.get("CLAWX_QUEUE_DONE_SETTLE_SECONDS", "10.0"))
+# Kill switch: 0 → oracle always UNKNOWN (pure idle-timer behavior).
 QUEUE_TURN_GATE_ENABLED = os.environ.get("CLAWX_QUEUE_TURN_GATE", "1") == "1"
-# Anti-wedge: if the jsonl gate keeps saying "busy" (format change, stuck
-# tool) but the oldest queued prompt has waited this long AND the time
-# gates pass, inject anyway and log loudly.
 QUEUE_WEDGE_OVERRIDE_SECONDS = float(
     os.environ.get("CLAWX_QUEUE_WEDGE_OVERRIDE_SECONDS", "900"))
-# Turn-gate staleness (2026-07-06): "last entry is user → busy" DEADLOCKS
-# when the CLI swallows/queues an injected prompt without ever starting a
-# turn — the unanswered user entry pins the gate False, every wedge
-# override adds another user entry, and the whole day runs on 900s wedge
-# pops (observed 07/06: every single pop was gate=wedge-override). If the
-# last entry is a USER row but the jsonl hasn't been written for this
-# long, the turn evidently never started/died — treat as unknown (None)
-# so the time gates take over. Pending assistant tool_use stays False
-# regardless of staleness: long silent tools are legitimate and bounded
-# by the wedge override.
+# Last real entry is a non-meta USER row but the jsonl hasn't been written
+# for this long → the turn never started or died (CLI swallowed/batched
+# the prompt; observed 07/06) → UNKNOWN, not ACTIVE, so the idle timer can
+# still deliver. Pending assistant tool_use stays ACTIVE regardless of
+# staleness: long silent tools are legitimate.
 QUEUE_TURN_STALE_SECONDS = float(
     os.environ.get("CLAWX_QUEUE_TURN_STALE_SECONDS", "300"))
-# Detector drift alarm (2026-07-05): the busy-marker regex went blind for
-# WEEKS after a CLI UI change and nothing shouted — the logs recorded
-# busy-clear values of 26000-52000s next to obviously active turns. This
-# meta-check makes heuristic breakage loud: if the session jsonl shows turn
-# activity within the window but the busy marker hasn't been seen for the
-# whole window, the detector is probably broken → ERROR log + one TG alert
-# per cooldown.
-DETECTOR_DRIFT_WINDOW_SECONDS = float(
-    os.environ.get("CLAWX_DETECTOR_DRIFT_WINDOW_SECONDS", str(2 * 3600)))
-DETECTOR_DRIFT_ALERT_COOLDOWN_SECONDS = 24 * 3600
+# Wedge-frequency anomaly alert: N wedge pops within WINDOW → one TG
+# alert per COOLDOWN.
+WEDGE_ALERT_THRESHOLD = 2
+WEDGE_ALERT_WINDOW_SECONDS = 3600
+WEDGE_ALERT_COOLDOWN_SECONDS = 24 * 3600
 
 # Modal-prompt detection: strip ANSI escape sequences before pattern matching
 # so colored TUI output doesn't fool the detector.
@@ -240,12 +224,17 @@ def _find_active_session_jsonl(prefer_project_dir=None):
     Claude CLI writes one jsonl per session under
     ``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl``.
 
-    When ``prefer_project_dir`` is given (the queue's turn gate passes
-    ClawX's own project dir), only that project's subdir is searched —
-    otherwise a concurrent ``claude`` session in another directory
-    (e.g. the user's own terminal work) with a fresher mtime would be
-    mistaken for ours. Falls back to the global most-recent file when
-    the preferred subdir has no sessions.
+    When ``prefer_project_dir`` is given, only that project's subdir is
+    searched — otherwise a concurrent ``claude`` session in another
+    directory with a fresher mtime would be mistaken for ours. Falls
+    back to the global most-recent file when the preferred subdir has
+    no sessions (fallback is logged by callers that care).
+
+    NOTE (2026-07-13): this is a HEURISTIC and must not be used as the
+    queue's turn oracle — a concurrent session in the SAME project dir
+    still wins the mtime race. The oracle uses the injection-correlated
+    pin (ClawX._pinned_jsonl) instead; this helper remains only as the
+    compact-verifier fallback when no pin exists yet.
     """
     proj_root = Path.home() / ".claude" / "projects"
     if not proj_root.exists():
@@ -266,7 +255,24 @@ def _find_active_session_jsonl(prefer_project_dir=None):
         return None
 
 
-def _verify_compact_in_jsonl(window_seconds: int = 120) -> bool:
+def _read_jsonl_tail(path, max_bytes):
+    """Read up to the last ``max_bytes`` of a jsonl file, or None on error.
+
+    Shared by the compact verifier and the turn oracle so seek/error
+    handling lives in exactly one place.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = min(size, max_bytes)
+            f.seek(size - chunk)
+            return f.read()
+    except OSError:
+        return None
+
+
+def _verify_compact_in_jsonl(window_seconds: int = 120, jsonl_path=None) -> bool:
     """Ground-truth check: did Claude CLI actually write a compact summary?
 
     Claude CLI marks a real compaction by writing a jsonl entry with
@@ -274,20 +280,19 @@ def _verify_compact_in_jsonl(window_seconds: int = 120) -> bool:
     (observed: ~3 ms lead). Checking the jsonl tail for a recent such
     entry gives us a ground truth the PTY text match can't provide.
 
+    ``jsonl_path`` should be the pinned session file when the caller has
+    one (ClawX passes its pin) — the mtime-freshest fallback can read a
+    concurrent session's file and dismiss a REAL compaction, which then
+    skips the post-compact identity reload.
+
     Returns True only if the jsonl's tail contains a compact summary
     entry whose timestamp is within ``window_seconds`` of now.
     """
-    jsonl = _find_active_session_jsonl()
+    jsonl = jsonl_path or _find_active_session_jsonl()
     if jsonl is None:
         return False
-    try:
-        with open(jsonl, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            chunk = min(size, 32 * 1024)
-            f.seek(size - chunk)
-            tail = f.read()
-    except OSError:
+    tail = _read_jsonl_tail(jsonl, 32 * 1024)
+    if tail is None:
         return False
     now = time.time()
     for raw in tail.splitlines()[-10:]:
@@ -310,7 +315,7 @@ def _verify_compact_in_jsonl(window_seconds: int = 120) -> bool:
     return False
 
 
-def detect_compact_event(buf: bytes):
+def detect_compact_event(buf: bytes, jsonl_path=None):
     """Detect a compact notification in PTY output.
 
     When Claude Code auto-compacts context it prints a sparkle-marked
@@ -348,8 +353,8 @@ def detect_compact_event(buf: bytes):
         return None
     # Round 3 — jsonl ground-truth gate. Assistant self-references
     # pass the regex but fail here because no real compact summary
-    # was written.
-    if not _verify_compact_in_jsonl():
+    # was written. jsonl_path is the caller's pinned session when known.
+    if not _verify_compact_in_jsonl(jsonl_path=jsonl_path):
         return None
     return True
 
@@ -650,22 +655,20 @@ class ClawX:
         self._inject_queue = deque()
         self._inject_queue_lock = Lock()
         self._pty_last_output_at = time.monotonic()
-        # HYP #3 ready-marker (2026-05-22): Claude Code prints "esc to
-        # interrupt" (+ animated spinner) continuously while it is streaming
-        # a response or running a tool. We track the last time that BUSY
-        # marker appeared; the drain loop refuses to inject until it has been
-        # gone for QUEUE_BUSY_CLEAR_SECONDS. This fixes the silent-bash false
-        # idle: during a quiet long bash the spinner still animates, so the
-        # busy marker stays fresh and we correctly defer injection. The 60s
-        # QUEUE_IDLE_SECONDS stays as an absolute fallback.
-        # Conservative default: treat as "recently busy" until the first
-        # idle is actually observed, so the queue gate can't inject during
-        # the very first in-flight response before any busy marker is seen.
-        self._pty_busy_at = time.monotonic()
-        # Rolling buffer for busy-marker tracking (see _maybe_track_busy_marker).
-        self._busy_track_buffer = bytearray()
-        # Detector drift alarm cooldown (epoch seconds).
-        self._drift_alert_cooldown_until = 0.0
+        # Session pin (2026-07-13 single-oracle): the jsonl file that is
+        # provably OUR child's session, established by injection
+        # correlation (see _maybe_pin_session) — never by mtime guessing,
+        # which reads the wrong file whenever another claude session runs
+        # in the same project dir. None until the first successful
+        # correlation; the oracle returns UNKNOWN while unpinned.
+        self._pinned_jsonl = None
+        # Pending correlation probe: {path: size_at_inject} + timestamp,
+        # snapshotted by inject() right after a successful PTY write.
+        self._pin_probe = None
+        self._pin_probe_at = 0.0
+        # Wedge-frequency anomaly tracking (successor to the drift alarm).
+        self._wedge_pop_times = deque(maxlen=10)
+        self._wedge_alert_cooldown_until = 0.0
 
     def build_command(self):
         """Build the claude CLI command."""
@@ -769,6 +772,11 @@ class ClawX:
                     # plaintext logs (logs/clawx-*.log is world-readable).
                     self.logger.info(f"[Inject] {redact_secrets(text[:200])}")
                     self._last_inject_ts = time.monotonic()
+                    # Injection-correlation probe: snapshot candidate jsonl
+                    # sizes now; the ONE file that grows in response to this
+                    # PTY write is our session (only our child received it).
+                    if self._pinned_jsonl is None:
+                        self._arm_pin_probe()
                     return True
                 except Exception as e:
                     self.logger.error(f"[Inject] Failed: {e}")
@@ -1266,7 +1274,8 @@ class ClawX:
         self._compact_buffer.extend(chunk)
         if len(self._compact_buffer) > 8192:
             del self._compact_buffer[:-8192]
-        if detect_compact_event(bytes(self._compact_buffer)) is None:
+        if detect_compact_event(bytes(self._compact_buffer),
+                                jsonl_path=self._pinned_jsonl) is None:
             return
         # Detected!
         self._compact_buffer = bytearray()
@@ -1374,46 +1383,190 @@ class ClawX:
             self.logger.info(
                 f"[Queue] enqueued '{name}', depth={len(self._inject_queue)}")
 
-    def _maybe_track_busy_marker(self, data: bytes):
-        """HYP #3: update _pty_busy_at when Claude's BUSY marker appears.
+    # ── Session pinning (injection correlation) ─────────────────────────
 
-        Claude Code prints "esc to interrupt" (with an animated spinner that
-        redraws every frame) the entire time it streams a response or runs a
-        tool — including silent long bash commands. So a fresh busy marker is
-        a reliable "Claude is working, do not inject" signal, and the silent
-        bash that fooled the pure-idle heuristic now keeps the marker fresh.
-        """
+    def _session_dir(self):
+        """The encoded ~/.claude/projects subdir for our project dir."""
+        encoded = re.sub(r"[^A-Za-z0-9]", "-", self._get_project_dir())
+        return Path.home() / ".claude" / "projects" / encoded
+
+    def _arm_pin_probe(self):
+        """Snapshot candidate jsonl sizes right after a PTY injection.
+
+        Only OUR child received the injected prompt, so the one file that
+        grows afterwards is provably our session. Called from inject()
+        while unpinned; _maybe_pin_session() evaluates the probe later
+        from the drain loop. Never raises."""
         try:
-            # Rolling buffer: the marker can split across 4096-byte reads.
-            self._busy_track_buffer.extend(data)
-            if len(self._busy_track_buffer) > _BUSY_TRACK_BUFFER_LIMIT:
-                del self._busy_track_buffer[:-_BUSY_TRACK_BUFFER_LIMIT]
-            clean = _ANSI_RE.sub(b"", bytes(self._busy_track_buffer))
-            # Squash ALL whitespace: v2.1.x renders the status line with
-            # cursor moves, so the stripped text has no spaces between
-            # words ("esctointerrupt"); squashing also still matches the
-            # old spaced rendering.
-            if _BUSY_MARKER_RE.search(_WS_RE.sub(b"", clean)):
-                self._pty_busy_at = time.monotonic()
-                # Clear so one old marker can't keep re-matching forever
-                # and pin us "busy" after the turn actually ends.
-                self._busy_track_buffer = bytearray()
+            subdir = self._session_dir()
+            if not subdir.exists():
+                return
+            self._pin_probe = {}
+            for p in subdir.glob("*.jsonl"):
+                try:
+                    self._pin_probe[p] = p.stat().st_size
+                except OSError:
+                    continue
+            self._pin_probe_at = time.monotonic()
         except Exception:
-            pass
+            self._pin_probe = None
+
+    PIN_PROBE_MIN_AGE_SECONDS = 3.0
+
+    def _maybe_pin_session(self):
+        """Evaluate a pending pin probe: the single candidate file that
+        grew since the probe was armed is our session jsonl.
+
+        Ambiguous results (zero or multiple grown files — e.g. the user's
+        own concurrent session also active in the same dir) discard the
+        probe; the next injection arms a fresh one. Never raises."""
+        if self._pinned_jsonl is not None or self._pin_probe is None:
+            return
+        if time.monotonic() - self._pin_probe_at < self.PIN_PROBE_MIN_AGE_SECONDS:
+            return  # give the CLI a moment to write the user entry
+        probe, self._pin_probe = self._pin_probe, None
+        grown = []
+        try:
+            for p, old_size in probe.items():
+                try:
+                    if p.stat().st_size > old_size:
+                        grown.append(p)
+                except OSError:
+                    continue
+            # A brand-new file (session created after probe) also counts.
+            subdir = self._session_dir()
+            if subdir.exists():
+                for p in subdir.glob("*.jsonl"):
+                    if p not in probe:
+                        grown.append(p)
+        except Exception:
+            return
+        if len(grown) == 1:
+            self._pinned_jsonl = grown[0]
+            self.logger.info(f"[Pin] session jsonl pinned: {grown[0].name}")
+        elif len(grown) > 1:
+            self.logger.info(
+                f"[Pin] ambiguous probe ({len(grown)} files grew) — "
+                "will retry on next injection")
+
+    # ── Turn-state oracle ────────────────────────────────────────────────
+
+    # Oracle states
+    TURN_ACTIVE = "ACTIVE"
+    TURN_DONE = "DONE"
+    TURN_UNKNOWN = "UNKNOWN"
+
+    def _turn_state(self, jsonl_path=None):
+        """Single oracle: what is OUR session's turn state?
+
+        Reads only the pinned session jsonl (or an explicit path in
+        tests). While unpinned → UNKNOWN: the mtime-freshest heuristic is
+        deliberately NOT used here, because a concurrent claude session
+        in the same project dir wins the mtime race and drove the gate
+        for days (07/09-11 wedge storms).
+
+        Walks the tail backwards to the last REAL conversation entry —
+        skipping non-user/assistant rows, isMeta rows (TG channel
+        deliveries etc.; 28/475 user rows in a live session), and
+        isSidechain rows (subagents):
+
+          assistant containing tool_use  → ACTIVE  (tool in flight; stays
+                                                    ACTIVE even when stale —
+                                                    long silent tools are
+                                                    legitimate)
+          assistant text/thinking        → DONE    (turn finished)
+          user, jsonl written recently   → ACTIVE  (response starting)
+          user, jsonl stale ≥ QUEUE_TURN_STALE_SECONDS
+                                         → UNKNOWN (prompt swallowed/
+                                                    batched — turn dead)
+          unpinned / unreadable / empty  → UNKNOWN
+        """
+        if jsonl_path is None:
+            jsonl_path = self._pinned_jsonl
+        if jsonl_path is None:
+            return self.TURN_UNKNOWN
+        tail = _read_jsonl_tail(jsonl_path, 64 * 1024)
+        if tail is None:
+            self._pinned_jsonl = None  # pin went bad (deleted/rotated)
+            return self.TURN_UNKNOWN
+        try:
+            mtime_age = time.time() - Path(jsonl_path).stat().st_mtime
+        except OSError:
+            return self.TURN_UNKNOWN
+        for raw in reversed(tail.splitlines()):
+            try:
+                entry = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if entry.get("type") not in ("user", "assistant"):
+                continue
+            if entry.get("isMeta") or entry.get("isSidechain"):
+                continue
+            if entry.get("type") == "user":
+                if mtime_age >= QUEUE_TURN_STALE_SECONDS:
+                    return self.TURN_UNKNOWN
+                return self.TURN_ACTIVE
+            content = (entry.get("message") or {}).get("content")
+            if isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_use"
+                    for b in content):
+                return self.TURN_ACTIVE
+            return self.TURN_DONE
+        return self.TURN_UNKNOWN
+
+    def _queue_pop_decision(self, now, state, oldest_enqueued_at):
+        """Pure policy: may a queued prompt be injected at `now` given the
+        oracle `state`? Returns a gate name or None.
+
+          DONE    + PTY quiet ≥ QUEUE_DONE_SETTLE_SECONDS → "done"
+          UNKNOWN + PTY quiet ≥ QUEUE_IDLE_SECONDS        → "idle"
+          ACTIVE  → None, unless the oldest item has waited ≥ WEDGE
+                    seconds AND the PTY has been quiet ≥ QUEUE_IDLE —
+                    a genuinely working turn produces output/spinner
+                    frames, so that combination means the ACTIVE reading
+                    is likely wrong → "wedge" (caller logs loudly).
+        """
+        idle_for = now - self._pty_last_output_at
+        if state == self.TURN_DONE:
+            return "done" if idle_for >= QUEUE_DONE_SETTLE_SECONDS else None
+        if state == self.TURN_UNKNOWN:
+            return "idle" if idle_for >= QUEUE_IDLE_SECONDS else None
+        # ACTIVE
+        if (oldest_enqueued_at is not None
+                and now - oldest_enqueued_at >= QUEUE_WEDGE_OVERRIDE_SECONDS
+                and idle_for >= QUEUE_IDLE_SECONDS):
+            return "wedge"
+        return None
+
+    def _note_wedge_pop(self):
+        """Anomaly signal (successor to the drift alarm): repeated wedge
+        pops mean the oracle is misreading — alert once per cooldown."""
+        now = time.time()
+        self._wedge_pop_times.append(now)
+        recent = [t for t in self._wedge_pop_times
+                  if now - t <= WEDGE_ALERT_WINDOW_SECONDS]
+        if len(recent) < WEDGE_ALERT_THRESHOLD:
+            return
+        if now < self._wedge_alert_cooldown_until:
+            return
+        self._wedge_alert_cooldown_until = now + WEDGE_ALERT_COOLDOWN_SECONDS
+        self.logger.error(
+            f"[Queue] {len(recent)} wedge pops within "
+            f"{WEDGE_ALERT_WINDOW_SECONDS/60:.0f}min — the turn oracle is "
+            f"probably misreading (bad pin? jsonl format change?). "
+            f"pinned={self._pinned_jsonl}")
+        self._send_telegram(
+            f"⚠️ ClawX queue 異常：{WEDGE_ALERT_WINDOW_SECONDS//60} 分鐘內 "
+            f"{len(recent)} 次 wedge 強制注入 — turn oracle 可能讀錯"
+            "（pin 失效或 jsonl 格式變了），排程可能會遲到，請看 log。",
+            tag="QueueAnomaly")
 
     def _queue_drain_loop(self):
-        """Pop queued prompts only when Claude looks idle-and-ready.
+        """Pop queued prompts only when the turn oracle says it's safe.
 
-        Two gates (HYP #3, 2026-05-22):
-          (a) READY: busy marker ("esc to interrupt") gone for
-              QUEUE_BUSY_CLEAR_SECONDS *and* no PTY output for
-              QUEUE_READY_IDLE_SECONDS — the precise "response finished"
-              signal that survives silent long bash.
-          (b) FALLBACK: PTY idle for the full QUEUE_IDLE_SECONDS (60s) — in
-              case the busy marker never appeared (e.g. a UI version change).
-
-        Either gate releases one queued prompt. The busy-marker gate is what
-        stops scheduled injects from cancelling an in-flight silent bash.
+        Timer-first ordering: the cheap PTY-idle check runs before any
+        jsonl I/O, so while Claude is visibly busy (output flowing) the
+        loop does no file reads at all.
         """
         while not self.stop_event.is_set():
             time.sleep(2.0)
@@ -1422,34 +1575,28 @@ class ClawX:
             with self._inject_queue_lock:
                 if not self._inject_queue:
                     continue
+                oldest = self._inject_queue[0][0]
             # Child dead / mid-respawn → hold queued prompts. Injecting now
-            # would write to a dead PTY and lose the prompt; after respawn,
-            # _reset_pty_detection_state gives the fresh child a full idle
-            # window before anything queued is delivered.
+            # would write to a dead PTY and lose the prompt.
             if not self._is_alive():
                 continue
+            self._maybe_pin_session()
             now = time.monotonic()
-            tc = self._jsonl_turn_complete() if QUEUE_TURN_GATE_ENABLED else None
-            gate = self._queue_inject_gate(now, tc)
+            # Cheap pre-check: nothing can pass any gate before the
+            # shortest quiet window, so skip the jsonl read entirely.
+            if now - self._pty_last_output_at < QUEUE_DONE_SETTLE_SECONDS:
+                continue
+            state = (self._turn_state() if QUEUE_TURN_GATE_ENABLED
+                     else self.TURN_UNKNOWN)
+            gate = self._queue_pop_decision(now, state, oldest)
             if gate is None:
-                # Anti-wedge: jsonl gate saying "busy" forever (stuck tool,
-                # format change) must not starve the queue. If the oldest
-                # item has waited past the override window AND the pure
-                # time gates would allow it, inject anyway — loudly.
-                with self._inject_queue_lock:
-                    oldest = (self._inject_queue[0][0]
-                              if self._inject_queue else None)
-                if (tc is False and oldest is not None
-                        and now - oldest > QUEUE_WEDGE_OVERRIDE_SECONDS
-                        and self._queue_inject_gate(now, None) is not None):
-                    self.logger.warning(
-                        "[Queue] wedge override — jsonl gate stuck busy "
-                        f"{QUEUE_WEDGE_OVERRIDE_SECONDS:.0f}s+, forcing pop")
-                    gate = "wedge-override"
-                else:
-                    continue
+                continue
+            if gate == "wedge":
+                self.logger.warning(
+                    "[Queue] wedge pop — oracle says ACTIVE but oldest "
+                    f"waited {now - oldest:.0f}s with quiet PTY; forcing")
+                self._note_wedge_pop()
             idle_for = now - self._pty_last_output_at
-            busy_clear_for = now - self._pty_busy_at
             with self._inject_queue_lock:
                 if not self._inject_queue:
                     continue
@@ -1457,145 +1604,8 @@ class ClawX:
             wait_s = time.monotonic() - enqueued_at
             self.logger.info(
                 f"[Queue] popping '{name}' (waited {wait_s:.1f}s, "
-                f"idle {idle_for:.1f}s, busy-clear {busy_clear_for:.1f}s, "
-                f"gate={gate})")
+                f"idle {idle_for:.1f}s, state={state}, gate={gate})")
             self.inject(prompt)
-
-    def _queue_inject_gate(self, now, turn_complete=None):
-        """Return the gate name ('ready' / 'idle-fallback') if a queued
-        prompt may be injected at time `now`, else None. Pure decision
-        function (no I/O) so the busy-marker logic is unit-testable.
-
-        turn_complete is the jsonl ground truth from _jsonl_turn_complete():
-        False = a turn is provably in flight (pending tool_use / fresh user
-        message) → NEVER inject, regardless of how quiet the PTY is. This is
-        what stops queued prompts from cancelling long silent bashes. True /
-        None (unknown) fall through to the time gates.
-
-        ready  : busy marker gone QUEUE_BUSY_CLEAR_SECONDS AND output quiet
-                 QUEUE_READY_IDLE_SECONDS — response/tool finished.
-        fallback: output quiet for the full QUEUE_IDLE_SECONDS regardless of
-                 busy marker (covers a UI change that drops the marker).
-        """
-        if turn_complete is False:
-            return None
-        idle_for = now - self._pty_last_output_at
-        busy_clear_for = now - self._pty_busy_at
-        if (busy_clear_for >= QUEUE_BUSY_CLEAR_SECONDS
-                and idle_for >= QUEUE_READY_IDLE_SECONDS):
-            return "ready"
-        if idle_for >= QUEUE_IDLE_SECONDS:
-            return "idle-fallback"
-        return None
-
-    def _jsonl_turn_complete(self, jsonl_path=None):
-        """Ground truth from the session jsonl: has the current turn ended?
-
-        Walks the jsonl tail backwards to the last real user/assistant
-        entry (skipping meta rows like queue-operation / last-prompt):
-
-          assistant, plain text/thinking → True  (turn finished)
-          assistant containing tool_use  → False (tool in flight — the
-                                                  silent-bash case; stays
-                                                  False even when stale,
-                                                  wedge override bounds it)
-          user, jsonl written recently   → False (Claude is about to
-                                                  respond or continue)
-          user, jsonl stale ≥300s        → None  (turn never started or
-                                                  died — the CLI swallowed
-                                                  or batched the prompt;
-                                                  without this the gate
-                                                  deadlocks, see
-                                                  QUEUE_TURN_STALE_SECONDS)
-          nothing parseable / no file    → None  (unknown — caller falls
-                                                  back to time gates)
-        """
-        if jsonl_path is None:
-            jsonl_path = _find_active_session_jsonl(
-                prefer_project_dir=self._get_project_dir())
-        if jsonl_path is None:
-            return None
-        try:
-            with open(jsonl_path, "rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                chunk = min(size, 64 * 1024)
-                f.seek(size - chunk)
-                tail = f.read()
-            mtime_age = time.time() - Path(jsonl_path).stat().st_mtime
-        except OSError:
-            return None
-        for raw in reversed(tail.splitlines()):
-            try:
-                entry = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            etype = entry.get("type")
-            if etype not in ("user", "assistant"):
-                continue
-            if etype == "user":
-                if mtime_age >= QUEUE_TURN_STALE_SECONDS:
-                    return None  # unanswered prompt — turn dead, not busy
-                return False
-            content = (entry.get("message") or {}).get("content")
-            if isinstance(content, list) and any(
-                    isinstance(b, dict) and b.get("type") == "tool_use"
-                    for b in content):
-                return False
-            return True
-        return None
-
-    def _detector_drift_check(self, now_epoch=None, now_mono=None):
-        """Meta-monitor: shout when the busy-marker detector looks blind.
-
-        Fires when ALL hold:
-          - ClawX has been up longer than the window (fresh spawns reset
-            _pty_busy_at, so a short uptime can't prove anything)
-          - the busy marker has NOT been seen for the whole window
-          - the session jsonl WAS modified within the window (turns are
-            actually happening — rules out a genuinely idle night)
-
-        That combination means turns run but the marker never matches —
-        i.e. a CLI UI change probably broke the regex again. ERROR log +
-        one TG alert per 24h cooldown. Called from _health_loop.
-        """
-        if not QUEUE_ENABLED:
-            return
-        now_epoch = time.time() if now_epoch is None else now_epoch
-        now_mono = time.monotonic() if now_mono is None else now_mono
-        if now_epoch < self._drift_alert_cooldown_until:
-            return
-        if self.started_at is None or (
-                (datetime.now() - self.started_at).total_seconds()
-                < DETECTOR_DRIFT_WINDOW_SECONDS):
-            return
-        busy_age = now_mono - self._pty_busy_at
-        if busy_age < DETECTOR_DRIFT_WINDOW_SECONDS:
-            return  # marker seen recently — detector healthy
-        jsonl = _find_active_session_jsonl(
-            prefer_project_dir=self._get_project_dir())
-        if jsonl is None:
-            return
-        try:
-            jsonl_age = now_epoch - jsonl.stat().st_mtime
-        except OSError:
-            return
-        if jsonl_age > DETECTOR_DRIFT_WINDOW_SECONDS:
-            return  # no turn activity either — genuinely idle, not drift
-        self._drift_alert_cooldown_until = (
-            now_epoch + DETECTOR_DRIFT_ALERT_COOLDOWN_SECONDS)
-        self.logger.error(
-            f"[DetectorDrift] busy marker unseen for {busy_age/3600:.1f}h "
-            f"but session jsonl active {jsonl_age/60:.0f}min ago — the "
-            f"busy-marker regex may be broken by a CLI update. Queue is "
-            f"running on idle-timers only; check [Queue] popping "
-            f"busy-clear values.")
-        self._send_telegram(
-            "⚠️ ClawX 偵測器漂移警報：busy marker 已 "
-            f"{busy_age/3600:.1f} 小時沒偵測到，但 session 明明有活動 — "
-            "CLI 改版可能又弄壞了忙碌偵測，queue 目前只剩計時器保護。"
-            "請查 log 的 busy-clear 數值。",
-            tag="DetectorDrift")
 
     def _is_alive(self):
         """Check if the child process is still running.
@@ -1709,11 +1719,6 @@ class ClawX:
                     self._scheduler_watchdog()
                 except Exception:
                     self.logger.exception("[Watchdog] check failed (non-fatal)")
-                try:
-                    self._detector_drift_check()
-                except Exception:
-                    self.logger.exception(
-                        "[DetectorDrift] check failed (non-fatal)")
             else:
                 # Child not alive. Respawn is owned by the main run() loop
                 # now (single-owner lifecycle) so the two threads can't race
@@ -1773,8 +1778,11 @@ class ClawX:
         self._permission_buffer = bytearray()
         self._compact_buffer = bytearray()
         self._pty_last_output_at = time.monotonic()
-        self._pty_busy_at = time.monotonic()
-        self._busy_track_buffer = bytearray()
+        # New child = new session: the old pin and any pending probe are
+        # invalid; the oracle stays UNKNOWN (conservative idle timer) until
+        # the first injection re-pins.
+        self._pinned_jsonl = None
+        self._pin_probe = None
 
     def _spawn_claude(self):
         """Fork + exec Claude in a PTY using pty.fork()."""
@@ -2215,8 +2223,6 @@ class ClawX:
                         # any output = Claude is active, reset idle clock.
                         self._pty_last_output_at = time.monotonic()
                         try:
-                            # HYP #3: track BUSY marker freshness for the queue.
-                            self._maybe_track_busy_marker(data)
                             # PTY stream watchers — all detection runs here.
                             self._maybe_handle_startup_modal(data)
                             self._maybe_handle_compact(data)
