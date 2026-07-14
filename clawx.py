@@ -1572,6 +1572,12 @@ class ClawX:
             time.sleep(2.0)
             if not QUEUE_ENABLED:
                 continue
+            # Evaluate pin probes EVERY tick, not only while queued: the
+            # probe must be judged seconds after the injection that armed
+            # it — only our file has grown that fast. Deferring until the
+            # next enqueued prompt (up to 30min) lets other sessions grow
+            # too → permanently ambiguous → never pins.
+            self._maybe_pin_session()
             with self._inject_queue_lock:
                 if not self._inject_queue:
                     continue
@@ -1580,7 +1586,6 @@ class ClawX:
             # would write to a dead PTY and lose the prompt.
             if not self._is_alive():
                 continue
-            self._maybe_pin_session()
             now = time.monotonic()
             # Cheap pre-check: nothing can pass any gate before the
             # shortest quiet window, so skip the jsonl read entirely.
